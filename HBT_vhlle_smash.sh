@@ -1,5 +1,5 @@
 #!/bin/bash
-
+#it inspired by https://github.com/yukarpenko/run-vhlle-smash 
 # number of events generated from freezeout hypersurface
 afterburner_events=50
 
