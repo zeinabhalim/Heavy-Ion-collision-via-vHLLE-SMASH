@@ -7,12 +7,13 @@ It aims to provide a  structured workflow for heavy-ion collision simulations ba
 5. Followed by the  particle sampling and hadronic transport using **SMASH**.
 
 The initial conditions used in this workflow are generated using a **Glauber collision model**.As a pre-generated `.dat` files describing the collision geometry and energy deposition.
-These `.dat` files serve as input for the hydrodynamic evolution stage (VHLLE).
+
 ---
 
 ##  Environment Setup:
 
-The initial simulation environment are performed by cloning the original repository:
+This hybrid setup has been inspired by yukarpenko who develope the vhlle smash respository ,
+Therefore,  the initial environment are performed by cloning the original repository:
 
 ```bash
 git clone https://github.com/yukarpenko/run-vhlle-smash 
