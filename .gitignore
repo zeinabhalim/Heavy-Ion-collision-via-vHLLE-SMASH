@@ -1,0 +1,13 @@
+# Simulation outputs
+hydro.out/
+smash.out/
+
+# Analysis outputs
+AuAu_RHIC200/analysisauau/*.csv
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.bak

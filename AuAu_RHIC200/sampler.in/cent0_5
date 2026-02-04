@@ -1,0 +1,5 @@
+surface AuAu_RHIC200/hydro.out/cent0_5/freezeout.dat
+spectra_dir AuAu_RHIC200/sampler.out/cent0_5
+number_of_events 50
+shear 1
+ecrit 0.5

@@ -1,0 +1,39 @@
+! EoS type: 0 = complex EoS, 1 = simple table (eosFile)
+eosType       1
+eosFile         Laine_nf3.dat
+eosTypeHadron 1
+chiBfile        chiB.txt
+chiSfile        chiS.txt
+T_ch          0.149
+mu_b          0.0285
+mu_q         -0.001
+mu_s          0.007
+gammaS        0.935
+gammaFactor   0.75
+exclVolume    0.0
+
+etaS      0.15
+zetaS     0.00
+e_crit    0.515
+
+nx        61
+ny        61
+nz        81
+xmin     -20.0
+xmax      20.0
+ymin     -20.0
+ymax      20.0
+etamin     -10.0
+etamax      10.0
+
+! icModel: 1=Glauber, 2=input from file,  3= urqmd IC (file)
+icModel    5
+glauberVar 1
+s0ScaleFactor  30.0
+epsilon0   15.0
+impactPar  0.0
+Rg      1
+Rgz     1
+tau0      0.6
+tauMax     20.0
+dtau       0.1
