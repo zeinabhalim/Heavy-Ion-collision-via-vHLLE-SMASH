@@ -1,6 +1,3 @@
-
-// Comparison of HBT analysis for pion pairs vs all particle pairs
-
 #include <TFile.h>
 #include <TTree.h>
 #include <TH1F.h>
@@ -19,7 +16,15 @@
 #include <sstream>
 #include <iostream>
 
+// Levy reader
+#include "Levy_proj_reader.h"
+
+Levy_reader* myLevy_reader;
+
+using namespace RooFit;
+
 using namespace std;
+
 
 // ===============================
 // Particle container
@@ -40,6 +45,18 @@ struct Particle {
     }
     
 };
+
+// =========================================
+// Levy fit function
+// =========================================
+double LevySource3D(double *x, double *par)
+{
+  double alpha = par[0];
+  double R = par[1];
+  double N = par[2];
+  double Rcc = (R*pow(2.,1./alpha));
+  return (2.*N/Rcc)*(myLevy_reader->getValue_1d(alpha, x[0]/Rcc));
+}
 
 // ===============================
 // Load OSCAR file
@@ -100,11 +117,6 @@ vector<Particle> LoadOSCAR(const char* fname) {
     double kT_min = 0.325;    // GeV/c
     double kT_max = 0.375;    // GeV/c
     
-
-    
-// ===============================
-// Analyze pairs function
-// ===============================
 // ===============================
 // Analyze pairs function
 // ===============================
@@ -120,18 +132,25 @@ TH1F* AnalyzePairs(const vector<Particle>& particles,
         events[p.event_id].push_back(p);
     }
     
-    // Create histogram
-    const int n_bins = 100;
-    double log_min = log10(0.1);
-    double log_max = log10(1000.0);
+  
+    // Estimate histogram bins
+    const int n_bins = 200;
+    double rho_min = 0.2;
+    double rho_max = 100.0;
+    
     double bins[n_bins + 1];
     
-    for (int i = 0; i <= n_bins; i++) {
-        bins[i] = pow(10, log_min + (log_max - log_min) * i / n_bins);
-    }
+    // constant rho space ratio
+    double r = pow(rho_max / rho_min, 1.0 / n_bins);
+
+    // build bin sequence
+     bins[0] = rho_min;
+    for (int i = 1; i <= n_bins; i++) {
+    bins[i] = bins[i-1] * r;
+     }
     
     TH1F* hRho = new TH1F(hist_name, hist_title, n_bins, bins);
-    hRho->Sumw2();
+    hRho->Sumw2(); //error progration
     
     // Pair analysis
     int pairs_count = 0;
@@ -162,50 +181,81 @@ TH1F* AnalyzePairs(const vector<Particle>& particles,
                 double kx = 0.5 * (p1.px + p2.px);
                 double ky = 0.5 * (p1.py + p2.py);
                 double kz = 0.5 * (p1.pz + p2.pz);
-                double kT = TMath::Sqrt(kx * kx + ky * ky);
+                double kT = TMath::Sqrt(kx * kx + ky * ky); 
                 
-                // Pair cuts
+                // pair transverse mass
+                double mpi = 0.13957;
+                double mT = sqrt(kT*kT + mpi*mpi);
+
+                 // mT dependent cut
+                 double c = 0.15 ; 
+                 double qmCut = sqrt(c * mT);
+           
+                  // relative momentum  in the LCMS
+                 double qx = p1.px - p2.px;
+                 double qy = p1.py - p2.py;
+                 double qzL = (4*pow((p1.pz * p2.E - p2.pz * p1.E),2))/(pow((p1.E+p2.E),2)-pow((p1.pz+p2.pz),2));
+
+                 double qLCMS = TMath::Sqrt(qx*qx + qy*qy + qzL);
+
+               // Pair cuts due to kT
                 if (kT < kT_min || kT > kT_max) continue;
+                 
+                //pair cuts due to QLCMS frame
+                if (qLCMS > qmCut) continue;
+
                 
                 pairs_count++;
                 
-                // Spatial separation in lab frame
-                double dx = p1.x - p2.x;  // Δx
-                double dy = p1.y - p2.y;  // Δy
-                double dz = p1.z - p2.z;  // Δz - THIS IS ALREADY z in lab frame
+                // Spatial separation
+                double dx = p1.x - p2.x;
+                double dy = p1.y - p2.y;
+                double dz = p1.z - p2.z;
+                double dt = p1.t - p2.t;
                 
-                // Apply Bertsch-Pratt coordinates EXACTLY as per equations
-                // Check to avoid division by zero
-                if (kT > 1e-10) {
-                    // r_out = (K_x/K_T) * Δx + (K_y/K_T) * Δy
-                    double r_out = (kx / kT) * dx + (ky / kT) * dy;
-                    
-                    // r_side = (-K_y/K_T) * Δx + (K_x/K_T) * Δy
-                    double r_side = (-ky / kT) * dx + (kx / kT) * dy;
-                    
-                    // r_long = Δz (as per your specification)
-                    // Note: This is z separation in lab frame, not LCMS
-                    double r_long = dz;
-                    
-                    // Calculate invariant pair distance
-                    double rho = sqrt(r_out * r_out + r_side * r_side + r_long * r_long);
-                    
-                    hRho->Fill(rho);
-                }
+                // LCMS transformation
+                double K0 = 0.5 * (p1.E + p2.E); //pair energy
+                double kp = K0*K0 - kz*kz;
+                 double phi = atan2(ky, kx); // azimuthal angle
+                
+                // Bertsch-Pratt coordinates
+                double r_out  = TMath::Cos(phi) * dx + TMath::Sin(phi) * dy - (kT/kp) * (K0*dt - kz*dz);
+                double r_side = - TMath::Sin(phi) * dx + TMath::Cos(phi) * dy;
+                double r_long = (K0*dz - kz*dt) / sqrt(kp);
+                
+                double rho = sqrt(r_out * r_out + r_side * r_side + r_long * r_long);
+                
+                hRho->Fill(rho);
             }
         }
     }
     
-    // Normalize histogram
+     // optimize counts to bin width and 4*pi space
+    for (int i = 1; i <= hRho->GetNbinsX(); i++)
+    {
+    double rho = hRho->GetBinCenter(i);
+    double bw  = hRho->GetBinWidth(i);
+    
+    double source_volume = 4.0 * TMath::Pi() * rho * rho * bw;
+
+    if (source_volume > 0){
+        hRho->SetBinContent(i, hRho->GetBinContent(i) / source_volume);
+        hRho->SetBinError(i,  hRho->GetBinError(i) / source_volume);
+       }
+    }
+    
+    // Normalizing histogram
     double total_integral = hRho->Integral("width");
     if (total_integral > 0) {
         hRho->Scale(1.0 / total_integral);
+        
     }
     
     cout << (pions_only ? "Pion pairs: " : "All pairs: ") << pairs_count << " pairs analyzed" << endl;
     
     return hRho;
 }
+
 
 
 // ===============================
@@ -219,7 +269,7 @@ void auauspital() {
     // =========================================
     // Configuration
     // =========================================
-    const char* oscar_file = "/home/zeinab/Documents/vhlle-smash/hybrid/AuAu_RHIC200/sampler.out/cent0_5/particle_lists_0.oscar";
+    const char* oscar_file = "/home/zeinab/Documents/vhlle-smash/hybrid/sampler.out/test_run/particle_lists.oscar";
     
     // =========================================
     // Load particles
@@ -237,24 +287,68 @@ void auauspital() {
     TH1F* hRho_pions = AnalyzePairs(particles, true, 
                                    "hRho_pions", 
                                    "Pion pairs distance distribution; #rho [fm]; D(#rho)");
-    
     // =========================================
     // Analyze all particle pairs
     // =========================================
     cout << "\n=== Analyzing All Particle Pairs ===" << endl;
     TH1F* hRho_all = AnalyzePairs(particles, false, 
                                  "hRho_all", 
-                                 "All particle pairs distance distribution; #rho [fm]; D(#rho)");
-    
-  
-    // =========================================
-    // Create comparison plot
-    // =========================================
-    TCanvas* c1 = new TCanvas("c1", "HBT Comparison: Pions vs All Particles", 1000, 800);
-    c1->SetLogx();
-    c1->SetLogy();
-    c1->SetGridx();
-    c1->SetGridy();
+                                 "All particle pairs distance distribution; #rho [fm]; D(#rho)");          
+            
+     TFile* outFile = new TFile("hbt_comparison_results.root","RECREATE");
+   // =========================================
+// Create canvas
+// =========================================
+TCanvas* c1 = new TCanvas("c1","HBT Comparison",1000,800);
+c1->SetLogx();
+c1->SetLogy();
+c1->SetGridx();
+c1->SetGridy();
+
+// Histogram styling
+hRho_pions->SetLineColor(kRed);
+hRho_pions->SetMarkerColor(kRed);
+hRho_pions->SetMarkerStyle(20);
+hRho_pions->SetMarkerSize(0.8);
+
+hRho_all->SetLineColor(kBlue);
+hRho_all->SetMarkerColor(kBlue);
+hRho_all->SetMarkerStyle(21);
+hRho_all->SetMarkerSize(0.8);
+
+// Axis labels
+hRho_pions->GetXaxis()->SetTitle("#rho [fm]");
+hRho_pions->GetYaxis()->SetTitle("D(#rho)");
+
+// Find range
+double max_val = std::max(hRho_pions->GetMaximum(), hRho_all->GetMaximum());
+
+// Draw histogram first
+hRho_pions->SetMinimum(1e-10);
+hRho_pions->SetMaximum(max_val*2);
+hRho_pions->Draw("E1");
+
+// Overlay second histogram
+hRho_all->Draw("E1 SAME");
+
+// =========================================
+// Perform levy fit
+// =========================================
+
+// Initialize Levy reader object
+myLevy_reader = new Levy_reader("levy_proj3D_values.dat");
+
+TF1 *levy = new TF1("levy", LevySource3D, 0.2, 40, 3);
+levy->SetParNames("alpha","R","N");
+levy->SetParameters(1.5, 4.38, 0.85); 
+levy->SetParLimits(0, 0.5, 2.5);  
+levy->SetParLimits(1, 0.1, 25.0); 
+levy->SetParLimits(2, 0.0, 2.0); 
+levy->SetLineColor(kBlack);
+
+levy->SetLineWidth(2);
+
+levy->Draw("E1");
     
     // Format pion histogram
     hRho_pions->SetLineColor(kRed);
@@ -263,6 +357,16 @@ void auauspital() {
     hRho_pions->SetMarkerSize(0.8);
     hRho_pions->SetLineWidth(1);
     
+    
+    hRho_pions->Fit(levy,"R"); 
+     cout << "\npion pairs Levy fit of AU-AU collision, levy fit:" << endl;
+    cout << "alpha = " << levy->GetParameter(0)
+     << " ± " << levy->GetParError(0) << endl;
+
+     cout << "R = " << levy->GetParameter(1)
+     << " ± " << levy->GetParError(1) << " fm" << endl;
+    
+    
     // Format all particles histogram
     hRho_all->SetLineColor(kBlue);
     hRho_all->SetMarkerColor(kBlue);
@@ -270,28 +374,49 @@ void auauspital() {
     hRho_all->SetMarkerSize(0.8);
     hRho_all->SetLineWidth(1);
     
+    // Reset initial parameters
+    levy->SetParameters(1.99, 4.3, 0.85); 
+    hRho_all->Fit(levy,"R"); 
+    
+    //fitting parameters
+    cout << "\nAll particle pairs of AU-AU collision, levy fit:" << endl;
+cout << "alpha = " << levy->GetParameter(0)
+     << " ± " << levy->GetParError(0) << endl;
+cout << "R     = " << levy->GetParameter(1)
+     << " ± " << levy->GetParError(1) << " fm" << endl;
+        
+    
+    hRho_pions->GetXaxis()->SetTitle("#rho [fm]");
+hRho_pions->GetYaxis()->SetTitle("D(#rho)");
+
+hRho_all->GetXaxis()->SetTitle("#rho [fm]");
+hRho_all->GetYaxis()->SetTitle("D(#rho)");
+    
     // Find suitable Y-axis range
-    double max_val = max(hRho_pions->GetMaximum(), hRho_all->GetMaximum());
     double min_val = min(hRho_pions->GetMinimum(1e-10), hRho_all->GetMinimum(1e-10));
     
     // Draw pion pairs first
-    hRho_pions->SetMaximum(max_val * 10);
-    hRho_pions->SetMinimum(min_val * 0.1);
-    hRho_pions->Draw("E1");
+    hRho_pions->SetMaximum(1e-10);
+    hRho_all->SetMinimum(1e-10);
+    hRho_pions->SetMinimum(1e-8);
+hRho_pions->SetMaximum(max_val*2);
+
+hRho_pions->Draw("E1");
+
     
     // Draw all particles on top
     hRho_all->Draw("E1 SAME");
-    
+
     // Create legend
-    TLegend* leg = new TLegend(0.15, 0.70, 0.45, 0.88);
-    leg->SetBorderSize(0);
-    leg->SetFillStyle(0);
-    leg->SetTextSize(0.035);
-    
-    leg->AddEntry(hRho_pions, "Identical pion pairs", "PE");
-   
-    leg->AddEntry(hRho_all, "All particle pairs", "PE");
-    leg->Draw();
+    TLegend* leg = new TLegend(0.15,0.70,0.45,0.88);
+leg->SetBorderSize(0);
+leg->SetFillStyle(0);
+
+leg->AddEntry(hRho_pions,"Identical pion pairs","PE");
+leg->AddEntry(hRho_all,"All particle pairs","PE");
+leg->AddEntry(levy,"Levy fit","L");
+
+leg->Draw();
     
     // Add title
     TLatex* title = new TLatex();
@@ -307,7 +432,7 @@ void auauspital() {
     infoBox->SetTextFont(42);
     infoBox->SetTextSize(0.035);
     infoBox->SetTextAlign(12);
-    infoBox->AddText(Form("%s , #sqrt{s_{NN}} = %.2f GeV", 
+    infoBox->AddText(Form("%s , #sqrt{s_{NN}} = %.2f TeV", 
                           collision_system, sqrt_sNN));
     infoBox->AddText(Form("Centrality : %s", 
                           centrality));
