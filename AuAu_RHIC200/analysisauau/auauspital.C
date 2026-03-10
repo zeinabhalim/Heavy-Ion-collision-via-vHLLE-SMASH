@@ -132,13 +132,15 @@ TH1F* AnalyzePairs(const vector<Particle>& particles,
         events[p.event_id].push_back(p);
     }
     
-  
-    // Estimate histogram bins
-    const int n_bins = 200;
-    double rho_min = 0.2;
-    double rho_max = 100.0;
-    
-    double bins[n_bins + 1];
+// =======================
+// Histogram binning
+// =======================
+
+const int n_bins = 200;
+double rho_min = 0.2;
+double rho_max = 100.0;
+
+ double bins[n_bins + 1];
     
     // constant rho space ratio
     double r = pow(rho_max / rho_min, 1.0 / n_bins);
@@ -148,9 +150,9 @@ TH1F* AnalyzePairs(const vector<Particle>& particles,
     for (int i = 1; i <= n_bins; i++) {
     bins[i] = bins[i-1] * r;
      }
-    
-    TH1F* hRho = new TH1F(hist_name, hist_title, n_bins, bins);
-    hRho->Sumw2(); //error progration
+     
+TH1F* hRho = new TH1F(hist_name, hist_title, n_bins, bins);
+hRho->Sumw2();
     
     // Pair analysis
     int pairs_count = 0;
@@ -326,10 +328,10 @@ double max_val = std::max(hRho_pions->GetMaximum(), hRho_all->GetMaximum());
 // Draw histogram first
 hRho_pions->SetMinimum(1e-10);
 hRho_pions->SetMaximum(max_val*2);
-hRho_pions->Draw("E1");
+hRho_pions->Draw("P");
 
 // Overlay second histogram
-hRho_all->Draw("E1 SAME");
+hRho_all->Draw("P SAME");
 
 // =========================================
 // Perform levy fit
@@ -338,17 +340,17 @@ hRho_all->Draw("E1 SAME");
 // Initialize Levy reader object
 myLevy_reader = new Levy_reader("levy_proj3D_values.dat");
 
-TF1 *levy = new TF1("levy", LevySource3D, 0.2, 40, 3);
+TF1 *levy = new TF1("levy", LevySource3D, 5, 50, 3);
 levy->SetParNames("alpha","R","N");
-levy->SetParameters(1.5, 4.38, 0.85); 
-levy->SetParLimits(0, 0.5, 2.5);  
-levy->SetParLimits(1, 0.1, 25.0); 
+levy->SetParameters(2.0, 4.38, 0.85); 
+levy->FixParameter(0,2.0);
+levy->SetParLimits(1, 0.1, 20.0); 
 levy->SetParLimits(2, 0.0, 2.0); 
 levy->SetLineColor(kBlack);
 
 levy->SetLineWidth(2);
 
-levy->Draw("E1");
+levy->Draw("P");
     
     // Format pion histogram
     hRho_pions->SetLineColor(kRed);
@@ -375,7 +377,8 @@ levy->Draw("E1");
     hRho_all->SetLineWidth(1);
     
     // Reset initial parameters
-    levy->SetParameters(1.99, 4.3, 0.85); 
+    levy->SetParameters(2.0, 4.3, 0.85); 
+    levy->FixParameter(0,2.0);
     hRho_all->Fit(levy,"R"); 
     
     //fitting parameters
@@ -395,17 +398,14 @@ hRho_all->GetYaxis()->SetTitle("D(#rho)");
     // Find suitable Y-axis range
     double min_val = min(hRho_pions->GetMinimum(1e-10), hRho_all->GetMinimum(1e-10));
     
-    // Draw pion pairs first
-    hRho_pions->SetMaximum(1e-10);
-    hRho_all->SetMinimum(1e-10);
     hRho_pions->SetMinimum(1e-8);
 hRho_pions->SetMaximum(max_val*2);
 
-hRho_pions->Draw("E1");
+hRho_pions->Draw("P");
 
     
     // Draw all particles on top
-    hRho_all->Draw("E1 SAME");
+    hRho_all->Draw("P SAME");
 
     // Create legend
     TLegend* leg = new TLegend(0.15,0.70,0.45,0.88);
@@ -414,7 +414,7 @@ leg->SetFillStyle(0);
 
 leg->AddEntry(hRho_pions,"Identical pion pairs","PE");
 leg->AddEntry(hRho_all,"All particle pairs","PE");
-leg->AddEntry(levy,"Levy fit","L");
+leg->AddEntry(levy,"Gauss. fit","L");
 
 leg->Draw();
     
@@ -451,6 +451,7 @@ leg->Draw();
     
     // Save canvases
     c1->Write();
+
     
     cout << "\n========================================" << endl;
     cout << "Output files created:" << endl;
