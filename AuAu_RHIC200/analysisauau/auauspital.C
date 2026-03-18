@@ -267,7 +267,6 @@ hRho->Sumw2();
     }
     
      // optimize counts to bin width and 4*pi space
-     // Replace your current normalization block with this:
      double total_pairs = hRho->GetEntries();
 
 for (int i = 1; i <= hRho->GetNbinsX(); i++)
