@@ -19,6 +19,13 @@
 #include <sstream>
 #include <iostream>
 
+// Levy reader
+#include "Levy_proj_reader.h"
+
+Levy_reader* myLevy_reader;
+
+using namespace RooFit;
+
 using namespace std;
 
 
@@ -45,42 +52,14 @@ struct Particle {
 // =========================================
 // Levy fit function
 // =========================================
-double LevySource(double *x, double *par) {
-    double r     = x[0];
-    double alpha = par[0];
-    double R     = par[1];
-    double N     = par[2];
-
-    // pervent singularity 
-    if (r < 1e-4) r = 1e-4;
-
-    // Adjust momentum space limit to converge
-    double q_limit = (alpha < 1.0) ? 60.0 : 30.0;
-    double q_max = q_limit / R; 
-
-    // Dynamic Stepping , to prevent the damping oscillations 
-    double points_per_oscillation = 15.0;
-    double dq_sine = (2.0 * TMath::Pi()) / (r * points_per_oscillation);
-    
-    // Calculate steps 
-    int steps = (int)(q_max / dq_sine);
-
-    // steps limits
-    if (steps < 200)  steps = 200;
-    if (steps > 8000) steps = 8000; 
-
-    double dq = q_max / (double)steps;
-    double sum = 0;
-
-    //numerical intgration loop
-    for (int i = 0; i < steps; i++) {
-        double q = (i + 0.5) * dq;
-        // The Integrand: q * sin(qr) * exp(-(qR)^alpha)
-        sum += q * TMath::Sin(q * r) * TMath::Exp(-TMath::Power(q * R, alpha)) * dq;
-    }
-
-    //  Normalized distribution
-    return N * (1.0 / (2.0 * TMath::Pi() * TMath::Pi() * r)) * sum;
+double LevySource3D(double *x, double *par)
+{
+  double alpha = par[0];
+  double R     = par[1];
+  double N     = par[2]; // This will now stay near 1.0
+  double Rcc   = R * pow(2.0, 1.0/alpha);
+   
+    return (N/Rcc/Rcc/Rcc)*(myLevy_reader->getValue_3d(alpha, x[0]/Rcc));
 }
 
 // ===============================
@@ -140,9 +119,7 @@ vector<Particle> LoadOSCAR(const char* fname) {
     // Kinematic cuts applied to all particles
     double pT_min = 0.15;     // GeV/c
     double pT_max = 1.0;      // GeV/c
-    double eta_cut = 1.0;     // |η| < 1.0
-   // double kT_min = 0.0;    // GeV/c
-  // double kT_max = 0.0;    // GeV/c
+    double eta_cut = 1.0;     
 
 
 // ===============================
@@ -168,8 +145,8 @@ TH1F* AnalyzePairs(const vector<Particle>& particles,
 // =======================
 
 const int n_bins = 150;
-double rho_min = 0.5;
-double rho_max = 40.0;
+double rho_min = 1.0;
+double rho_max = 30.0;
 
  double bins[n_bins + 1];
     
@@ -227,12 +204,9 @@ hRho->Sumw2();
                   // relative momentum  in the LCMS
                  double qx = p1.px - p2.px;
                  double qy = p1.py - p2.py;
-                 double numerator = 2.0 * (p1.pz * p2.E - p2.pz * p1.E);
-                 double denominator = sqrt(pow(p1.E + p2.E,2) - pow(p1.pz + p2.pz,2));
+                 double qzL = (4*pow((p1.pz * p2.E - p2.pz * p1.E),2))/(pow((p1.E+p2.E),2)-pow((p1.pz+p2.pz),2));
 
-                  double qzL = numerator / denominator;
-
-                  double qLCMS = sqrt(qx*qx + qy*qy + qzL*qzL);
+                 double qLCMS = TMath::Sqrt(qx*qx + qy*qy + qzL);
 
                // Pair cuts due to kT
                 if (kT < kT_min || kT > kT_max) continue;
@@ -265,26 +239,37 @@ hRho->Sumw2();
             }
         }
     }
-    
-     // optimize counts to bin width and 4*pi space
-     double total_pairs = hRho->GetEntries();
+// =========================================
+// Convert Counts to 3D Density D(rho)
+// =========================================
+// =========================================
+// Convert Counts to 3D Density D(rho)
+// =========================================
+
+// Use ONLY physical bins (exclude under/overflow)
+double total_pairs = hRho->Integral(1, hRho->GetNbinsX());
 
 for (int i = 1; i <= hRho->GetNbinsX(); i++)
 {
-    double r  = hRho->GetBinCenter(i);
-    double bw = hRho->GetBinWidth(i);
+    double rho = hRho->GetBinCenter(i);
+    double bw  = hRho->GetBinWidth(i);
 
-    double shell = 4.0 * TMath::Pi() * r * r * bw;
+    // Spherical phase-space element
+    double volume_element = 4.0 * TMath::Pi() * rho * rho * bw;
 
-    if (shell > 0 && total_pairs > 0)
+    if (volume_element > 0 && total_pairs > 0)
     {
-        hRho->SetBinContent(i, hRho->GetBinContent(i) / (shell * total_pairs));
-        hRho->SetBinError(i,  hRho->GetBinError(i)  / (shell * total_pairs));
+        double content = hRho->GetBinContent(i);
+        double error   = hRho->GetBinError(i);
+
+        // Normalize to probability density
+        hRho->SetBinContent(i, content / (volume_element * total_pairs));
+        hRho->SetBinError(i,   error   / (volume_element * total_pairs));
     }
 }
 
-    hRho->SetMinimum(1e-12);
-    
+// Safety for log plots
+hRho->SetMinimum(1e-12);
     cout << (pions_only ? "Pion pairs: " : "All pairs: ") << pairs_count << " pairs analyzed" << endl;
 
     return hRho;
@@ -295,7 +280,7 @@ for (int i = 1; i <= hRho->GetNbinsX(); i++)
 // ===============================
 // Main function
 // ===============================
-void auauspital() {
+void auaubackref() {
     gStyle->SetOptStat(0);
     gStyle->SetOptTitle(0);
     TH1::AddDirectory(kFALSE);
@@ -318,38 +303,29 @@ void auauspital() {
     // Create output files once
     // =========================================
     TFile* outFile = new TFile("hbt_comparison_results.root","RECREATE");
-    ofstream fout("levy_fit_intgApproacgresults.txt");
+    ofstream fout("levy_fit_resultsWref30fm.txt");
     
-       fout << "\n==================================================================================================\n";
-fout << "                 Levy Fit Results , Direct integration approach \n";
+    fout << "\n==================================================================================================\n";
+fout << "                 Levy Fit Results using Levy reader file ,rho range( 1-30 fm)  \n";
 fout << "=========================================================================================================\n";
 
      fout << setw(12) << "kT_range"
-     << setw(19) << "alpha_pion"
-     << setw(19) << "R_pion"
-     << setw(17) << "lambda_pion"
-     << setw(17) << "alpha_all"
-     << setw(17) << "R_all"
-     << setw(17) << "lambda_all"
-     << setw(18) << "chi2/NDF_pion"
-     << setw(19) << "chi2/NDF_all"
+     << setw(17) << "alpha"
+     << setw(17) << "R [fm]"
+     << setw(17) << "lambda"
+     << setw(15) << "chi2"
+     << setw(12) << "NDF"
+     << setw(12) << "C.L."
      << "\n";
-
-fout << setw(12) << "kT_range"
-     << setw(19) << "alpha_pion"
-     << setw(19) << "R_pion"
-     << setw(17) << "lambda_pion"
-     << setw(17) << "alpha_all"
-     << setw(17) << "R_all"
-     << setw(17) << "lambda_all" << "\n";
 
     // =========================================
     // Analyze pion pairs
     // =========================================
-    vector<double> kT_bins =
-{0.10,0.15,0.20,0.25,0.30,0.35,0.40,0.45,0.50,0.55};
+    vector<double> kT_bins = {0.25,0.33,0.38,0.40,0.45};
+//{0.10,0.15,0.20,0.25,0.33,0.38,0.40,0.45,0.50,0.55};
 
 int nBins = kT_bins.size()-1;
+myLevy_reader = new Levy_reader("levy_proj3D_values.dat");
 
 
 for(int ibin=0; ibin<nBins; ibin++)
@@ -368,18 +344,6 @@ for(int ibin=0; ibin<nBins; ibin++)
         "Pion pairs "
     );
 
-    TH1F* hRho_all = AnalyzePairs(
-        particles,
-        kT_min,
-        kT_max,
-        false,
-        Form("hRho_all_%d",ibin),
-        "All pairs "
-    );
-
-
-
-     
    // =========================================
 // Create canvas
 // =========================================
@@ -395,17 +359,16 @@ hRho_pions->SetMarkerColor(kRed);
 hRho_pions->SetMarkerStyle(20);
 hRho_pions->SetMarkerSize(0.8);
 
-hRho_all->SetLineColor(kBlue);
-hRho_all->SetMarkerColor(kBlue);
-hRho_all->SetMarkerStyle(21);
-hRho_all->SetMarkerSize(0.8);
+
+
+
 
 // Axis labels
 hRho_pions->GetXaxis()->SetTitle("#rho [fm]");
 hRho_pions->GetYaxis()->SetTitle("D(#rho)");
 
 // Find range
-double max_val = std::max(hRho_pions->GetMaximum(), hRho_all->GetMaximum());
+double max_val = hRho_pions->GetMaximum();
 
 // Draw histogram first
 hRho_pions->SetMinimum(1e-10);
@@ -419,18 +382,21 @@ hRho_pions->SetMaximum(max_val*2);
 // Initialize Levy reader object
 
 
-TF1 *levy = new TF1("levyFit", LevySource, 0.5, 40.0, 3);
-
+TF1 *levy = new TF1("levy", LevySource3D, 1.0, 30.0, 3);
 
 levy->SetParNames("alpha","R","N");
 
-levy->SetParameters(1.2,1.0,1.0);
-levy->SetParLimits(0,0.5,2.0);   // alpha
-levy->SetParLimits(1,2.0,10.0);  // R
-levy->SetParLimits(2,0.1,5.0);   // N
 
+// Starting values
+levy->SetParameters(1.704, 4.48, 1.013);
+
+// Limits for fitting
+levy->SetParLimits(0, 0.5, 2.0);   // alpha
+levy->SetParLimits(1, 2.0, 15.0);  // R
+levy->SetParLimits(2, 0.5, 2.0);   // N
 levy->SetNpx(1000);
 
+ 	
 double fit_min = 1.0;
 double fit_max = 30.0;
 
@@ -445,57 +411,37 @@ levy->SetLineWidth(2);
     hRho_pions->SetMarkerSize(0.8);
     hRho_pions->SetLineWidth(1);
     
-    // ----- PION FIT -----
+    
 hRho_pions->Fit(levy,"RM","",fit_min,fit_max);
-
-double chi2_pion = levy->GetChisquare();
-double ndf_pion  = levy->GetNDF();
-double chi2ndf_pion = chi2_pion/ndf_pion;
-
-TF1 *levy_pions = (TF1*)levy->Clone("levy_pions");
-levy_pions->SetLineColor(kRed);
-levy_pions->SetLineWidth(2);
-
+    levy->SetLineColor(kRed);
     
-    // Format all particles histogram
-    hRho_all->SetLineColor(kBlue);
-    hRho_all->SetMarkerColor(kBlue);
-    hRho_all->SetMarkerStyle(21);
-    hRho_all->SetMarkerSize(0.8);
-    hRho_all->SetLineWidth(1);
+    TF1 *levy_pions = (TF1*)levy->Clone("levy_pions");
+    double chi2 = levy_pions->GetChisquare();
+double NDF  = levy_pions->GetNDF();
+double chi2ndf_pion = chi2 / NDF;
+double CL = TMath::Prob(chi2, NDF);
 
-// ----- ALL PARTICLES FIT -----
-levy->SetParameters(1.2,2.0,1.0);
+  cout << "\npion pairs Levy fit of AU-AU collision, levy fit:" << endl;
+    cout << "alpha = " << levy->GetParameter(0)
+     << " ± " << levy->GetParError(0) << endl;
 
-hRho_all->Fit(levy,"R","",fit_min,fit_max);
-
-double chi2_all = levy->GetChisquare();
-double ndf_all  = levy->GetNDF();
-double chi2ndf_all = chi2_all/ndf_all;
-
-
-    TF1 *levy_all = (TF1*)levy->Clone("levy_all");
-levy_all->SetLineColor(kBlue);
-levy_all->SetLineWidth(2);
-    
-    hRho_pions->GetXaxis()->SetTitle("#rho [fm]");
-    hRho_pions->GetYaxis()->SetTitle("D(#rho)");
-
-    hRho_all->GetXaxis()->SetTitle("#rho [fm]");
-    hRho_all->GetYaxis()->SetTitle("D(#rho)");
-
-    
-    // Find suitable Y-axis range
-    double min_val = min(hRho_pions->GetMinimum(1e-10), hRho_all->GetMinimum(1e-10));
+     cout << "R = " << levy->GetParameter(1)
+     << " ± " << levy->GetParError(1) << " fm" << endl;
+     
+     cout << "lamda = " << levy->GetParameter(2)
+     << " ± " << levy->GetParError(2) << endl;
+     
+             cout << "chi2/NDF = " << chi2 << "/" << NDF << "  C.L. = " << CL << endl;
     
     hRho_pions->SetMinimum(1e-8);
-hRho_pions->SetMaximum(max_val*2);
+    hRho_pions->SetMaximum(max_val*2);
+    hRho_pions->GetXaxis()->SetTitle("#rho [fm]");
+    hRho_pions->GetYaxis()->SetTitle("D(#rho)");
+    hRho_pions->Draw("P");
 
-hRho_pions->Draw("P");
-hRho_all->Draw("P SAME");
 
 levy_pions->Draw("SAME");
-levy_all->Draw("SAME");
+
 
     // Create legend
     TLegend* leg = new TLegend(0.60, 0.15, 0.90, 0.35);
@@ -503,8 +449,8 @@ leg->SetBorderSize(0);
 leg->SetFillStyle(0);
 
 leg->AddEntry(hRho_pions,"Identical pion pairs","PE");
-leg->AddEntry(hRho_all,"All particle pairs","PE");
-//leg->AddEntry(levy,"LeVy fit","L");
+
+
 
 leg->Draw();
     
@@ -513,7 +459,7 @@ leg->Draw();
     title->SetNDC();
     title->SetTextFont(42);
     title->SetTextSize(0.045);
-    title->DrawLatex(0.15, 0.92, "Levy fit , Numerical Integration Approach ");
+    title->DrawLatex(0.15, 0.92, "Levy fit, Grid intrapolation Approach");
     
     // Add system information
 
@@ -530,11 +476,10 @@ infoBox->SetTextSize(0.035);
     infoBox->AddText(Form("  %.2f < p_{T} [GeV/c] < %.2f", pT_min, pT_max));
     infoBox->AddText(Form("  |#eta| < %.1f", eta_cut));
     infoBox->AddText(Form("  %.2f < k_{T}[GeV/c] < %.2f", kT_min, kT_max));
-
-    
-    infoBox->Draw();
-    
-    //fit box
+  
+        infoBox->Draw();
+        
+        //fit box
 TPaveText* fitBox = new TPaveText(0.15,0.60,0.45,0.85,"NDC");
 fitBox->SetFillColor(0);
 fitBox->SetBorderSize(1);
@@ -544,38 +489,41 @@ fitBox->SetTextAlign(12);
 
 fitBox->AddText("Levy Fit Results");
 
-fitBox->AddText(Form("Pions: #alpha = %.3f #pm %.3f",
-levy_pions->GetParameter(0),levy_pions->GetParError(0)));
+
+fitBox->AddText(Form("alpha = %.3f #pm %.3f",
+                     levy_pions->GetParameter(0),
+                     levy_pions->GetParError(0)));
 
 fitBox->AddText(Form("R = %.3f #pm %.3f fm",
-levy_pions->GetParameter(1),levy_pions->GetParError(1)));
+                     levy_pions->GetParameter(1),
+                     levy_pions->GetParError(1)));
 
 fitBox->AddText(Form("#lambda = %.3f #pm %.3f",
-levy_pions->GetParameter(2),levy_pions->GetParError(2)));
+                     levy_pions->GetParameter(2),
+                     levy_pions->GetParError(2)));
 
-fitBox->AddText(Form("#chi^{2}/NDF = %.2f",chi2ndf_pion));
+fitBox->AddText(Form("#chi^{2}/NDF = %.2f / %.0f", chi2, NDF));
+
+fitBox->AddText(Form("C.L. = %.2f%%", CL));
 
 fitBox->AddText(" ");
 
-fitBox->AddText(Form("All pairs #chi^{2}/NDF = %.2f",chi2ndf_all));
-
     fitBox->Draw();
     
+
     
-     //loading fit results
+   //loading fit results
 fout << setw(12) << Form("%.2f-%.2f", kT_min, kT_max)
      << setw(20) << Form("%.5f±%.5f", levy_pions->GetParameter(0), levy_pions->GetParError(0))
      << setw(20) << Form("%.5f±%.5f", levy_pions->GetParameter(1), levy_pions->GetParError(1))
      << setw(20) << Form("%.5f±%.5f", levy_pions->GetParameter(2), levy_pions->GetParError(2))
-     << setw(20) << Form("%.5f±%.5f", levy_all->GetParameter(0), levy_all->GetParError(0))
-     << setw(20) << Form("%.5f±%.5f", levy_all->GetParameter(1), levy_all->GetParError(1))
-     << setw(20) << Form("%.5f±%.5f", levy_all->GetParameter(2), levy_all->GetParError(2))
-     << setw(15) << Form("%.3f", chi2ndf_pion)
-     << setw(15) << Form("%.3f", chi2ndf_all)
+     << setw(10) << Form("%.2f", chi2)
+     << setw(10) << Form("%.0f", NDF)
+     << setw(10) << Form("%.3f", CL)
      << "\n";
 
        // Save canvas as PNG and also to ROOT file
-        c1->SaveAs(Form("hbt_comparisonintgmeth_kT_%.2f-%.2f.png",kT_min,kT_max));
+        c1->SaveAs(Form("hbt_comparison_kT_%.2f-%.2f.png",kT_min,kT_max));
         c1->Write();
 
     }
@@ -585,7 +533,7 @@ fout << setw(12) << Form("%.2f-%.2f", kT_min, kT_max)
 
     cout << "\n========================================" << endl;
     cout << "Output files created:" << endl;
-    cout << "  - hbt_comparison_pions_vs_all.png" << endl;
+    cout << "  - hbt_comparison_pions30fm.png" << endl;
     cout << "  - hbt_comparison_results.root" << endl;
     cout << "========================================" << endl;
     
