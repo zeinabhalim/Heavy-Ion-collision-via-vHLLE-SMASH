@@ -59,7 +59,7 @@ double LevySource3D(double *x, double *par)
   double N     = par[2]; // This will now stay near 1.0
   double Rcc   = R * pow(2.0, 1.0/alpha);
    
-    return (N/Rcc/Rcc/Rcc)*(myLevy_reader->getValue_3d(alpha, x[0]/Rcc));
+    return  (N / (Rcc*Rcc*Rcc)) * myLevy_reader->getValue_3d(alpha, x[0]/Rcc);
 }
 
 // ===============================
@@ -145,8 +145,8 @@ TH1F* AnalyzePairs(const vector<Particle>& particles,
 // =======================
 
 const int n_bins = 150;
-double rho_min = 1.0;
-double rho_max = 30.0;
+double rho_min = 0.7;
+double rho_max = 45.0;
 
  double bins[n_bins + 1];
     
@@ -371,9 +371,7 @@ hRho_pions->GetYaxis()->SetTitle("D(#rho)");
 double max_val = hRho_pions->GetMaximum();
 
 // Draw histogram first
-hRho_pions->SetMinimum(1e-10);
 hRho_pions->SetMaximum(max_val*2);
-
 
 // =========================================
 // Perform levy fit
@@ -382,7 +380,7 @@ hRho_pions->SetMaximum(max_val*2);
 // Initialize Levy reader object
 
 
-TF1 *levy = new TF1("levy", LevySource3D, 1.0, 30.0, 3);
+TF1 *levy = new TF1("levy", LevySource3D, 0.7, 45.0, 3);
 
 levy->SetParNames("alpha","R","N");
 
@@ -394,131 +392,104 @@ levy->SetParameters(1.704, 4.48, 1.013);
 levy->SetParLimits(0, 0.5, 2.0);   // alpha
 levy->SetParLimits(1, 2.0, 15.0);  // R
 levy->SetParLimits(2, 0.5, 2.0);   // N
-levy->SetNpx(1000);
+
 
  	
 double fit_min = 1.0;
 double fit_max = 30.0;
+hRho_pions->Fit(levy, "RM", "", fit_min, fit_max);
 
-levy->SetLineWidth(2);
+// Retrieve fit results
+double chi2   = levy->GetChisquare();
+double ndf    = levy->GetNDF();
+double chi2ndf = chi2 / ndf;
+double CL     = TMath::Prob(chi2, ndf);
 
+// ----- Create two drawing functions -----
 
-    
-    // Format pion histogram
-    hRho_pions->SetLineColor(kRed);
-    hRho_pions->SetMarkerColor(kRed);
-    hRho_pions->SetMarkerStyle(20);
-    hRho_pions->SetMarkerSize(0.8);
-    hRho_pions->SetLineWidth(1);
-    
-    
-hRho_pions->Fit(levy,"RM","",fit_min,fit_max);
-    levy->SetLineColor(kRed);
-    
-    TF1 *levy_pions = (TF1*)levy->Clone("levy_pions");
-    double chi2 = levy_pions->GetChisquare();
-double NDF  = levy_pions->GetNDF();
-double chi2ndf_pion = chi2 / NDF;
-double CL = TMath::Prob(chi2, NDF);
+// 1. Full curve (extrapolated) – start at 0.9 to avoid reader instability at <0.5
+TF1* f_full = new TF1("f_full", LevySource3D, 0.7, 45.0, 3); 
+f_full->SetParameters(levy->GetParameters()); // Sync params with fit
+f_full->SetLineColor(kRed);
+f_full->SetLineStyle(2); // Dashed
+f_full->SetLineWidth(2);
+f_full->SetNpx(5000);    // High resolution for log-x smoothness
 
-  cout << "\npion pairs Levy fit of AU-AU collision, levy fit:" << endl;
-    cout << "alpha = " << levy->GetParameter(0)
-     << " ± " << levy->GetParError(0) << endl;
+// 2. Fitted region – solid line
+TF1* f_fit = new TF1("f_fit", LevySource3D, 1.0, 30.0, 3);
+f_fit->SetParameters(levy->GetParameters());
+f_fit->SetLineColor(kRed);
+f_fit->SetLineStyle(1); // Solid
+f_fit->SetLineWidth(3);
+f_fit->SetNpx(1000);
 
-     cout << "R = " << levy->GetParameter(1)
-     << " ± " << levy->GetParError(1) << " fm" << endl;
-     
-     cout << "lamda = " << levy->GetParameter(2)
-     << " ± " << levy->GetParError(2) << endl;
-     
-             cout << "chi2/NDF = " << chi2 << "/" << NDF << "  C.L. = " << CL << endl;
-    
-    hRho_pions->SetMinimum(1e-8);
-    hRho_pions->SetMaximum(max_val*2);
-    hRho_pions->GetXaxis()->SetTitle("#rho [fm]");
-    hRho_pions->GetYaxis()->SetTitle("D(#rho)");
-    hRho_pions->Draw("P");
+// ----- Draw everything -----
+hRho_pions->SetMinimum(1e-11); // Set slightly below the function floor
+hRho_pions->SetMaximum(max_val * 5);
+hRho_pions->Draw("P");          // Draw data points
+f_full->Draw("SAME");           // Draw dashed line underneath
+f_fit->Draw("SAME");            // Draw solid line on top
 
-
-levy_pions->Draw("SAME");
+// Print results to console
+cout << "\npion pairs Levy fit of AU-AU collision, levy fit:" << endl;
+cout << "alpha = " << levy->GetParameter(0) << " ± " << levy->GetParError(0) << endl;
+cout << "R     = " << levy->GetParameter(1) << " ± " << levy->GetParError(1) << " fm" << endl;
+cout << "lambda= " << levy->GetParameter(2) << " ± " << levy->GetParError(2) << endl;
+cout << "chi2/NDF = " << chi2 << "/" << ndf << "  C.L. = " << CL << endl;
 
 
-    // Create legend
-    TLegend* leg = new TLegend(0.60, 0.15, 0.90, 0.35);
+// ----- Legend -----
+TLegend* leg = new TLegend(0.60, 0.15, 0.90, 0.35);
 leg->SetBorderSize(0);
 leg->SetFillStyle(0);
-
-leg->AddEntry(hRho_pions,"Identical pion pairs","PE");
-
-
-
+leg->AddEntry(hRho_pions, "Identical pion pairs", "PE");
+leg->AddEntry(f_fit,      "Levy fit (fitted range)", "L");
+leg->AddEntry(f_full,     "Levy fit (extrapolated)", "L");
 leg->Draw();
-    
-    // Add title
-    TLatex* title = new TLatex();
-    title->SetNDC();
-    title->SetTextFont(42);
-    title->SetTextSize(0.045);
-    title->DrawLatex(0.15, 0.92, "Levy fit, Grid intrapolation Approach");
-    
-    // Add system information
 
-    TPaveText* infoBox = new TPaveText(0.60, 0.65, 0.95, 0.85, "NDC");
-infoBox->SetTextSize(0.035); 
-    infoBox->SetFillColor(0);
-    infoBox->SetBorderSize(1);
-    infoBox->SetTextFont(42);
-    infoBox->SetTextAlign(12);
-    infoBox->AddText(Form("%s , #sqrt{s_{NN}} = %.2f GeV", 
-                          collision_system, sqrt_sNN));
-    infoBox->AddText(Form("Centrality : %s", 
-                          centrality));
-    infoBox->AddText(Form("  %.2f < p_{T} [GeV/c] < %.2f", pT_min, pT_max));
-    infoBox->AddText(Form("  |#eta| < %.1f", eta_cut));
-    infoBox->AddText(Form("  %.2f < k_{T}[GeV/c] < %.2f", kT_min, kT_max));
-  
-        infoBox->Draw();
-        
-        //fit box
-TPaveText* fitBox = new TPaveText(0.15,0.60,0.45,0.85,"NDC");
+// ----- Title -----
+TLatex* title = new TLatex();
+title->SetNDC();
+title->SetTextFont(42);
+title->SetTextSize(0.045);
+title->DrawLatex(0.15, 0.92, "Levy fit, Grid interpolation Approach");
+
+// ----- Information box -----
+TPaveText* infoBox = new TPaveText(0.60, 0.65, 0.95, 0.85, "NDC");
+infoBox->SetTextSize(0.035);
+infoBox->SetFillColor(0);
+infoBox->SetBorderSize(1);
+infoBox->SetTextFont(42);
+infoBox->SetTextAlign(12);
+infoBox->AddText(Form("%s , #sqrt{s_{NN}} = %.0f GeV", collision_system, sqrt_sNN));
+infoBox->AddText(Form("Centrality : %s", centrality));
+infoBox->AddText(Form("  %.2f < p_{T} [GeV/c] < %.2f", pT_min, pT_max));
+infoBox->AddText(Form("  |#eta| < %.1f", eta_cut));
+infoBox->AddText(Form("  %.2f < k_{T}[GeV/c] < %.2f", kT_min, kT_max));
+infoBox->Draw();
+
+// ----- Fit results box -----
+TPaveText* fitBox = new TPaveText(0.15, 0.60, 0.45, 0.85, "NDC");
 fitBox->SetFillColor(0);
 fitBox->SetBorderSize(1);
 fitBox->SetTextFont(42);
 fitBox->SetTextSize(0.035);
 fitBox->SetTextAlign(12);
-
 fitBox->AddText("Levy Fit Results");
+fitBox->AddText(Form("#alpha = %.3f #pm %.3f", levy->GetParameter(0), levy->GetParError(0)));
+fitBox->AddText(Form("R = %.3f #pm %.3f fm", levy->GetParameter(1), levy->GetParError(1)));
+fitBox->AddText(Form("#lambda = %.3f #pm %.3f", levy->GetParameter(2), levy->GetParError(2)));
+fitBox->AddText(Form("#chi^{2}/NDF = %.2f / %.0f", chi2, ndf));
+fitBox->AddText(Form("C.L. = %.2f%%", CL * 100));
+fitBox->Draw();
 
-
-fitBox->AddText(Form("alpha = %.3f #pm %.3f",
-                     levy_pions->GetParameter(0),
-                     levy_pions->GetParError(0)));
-
-fitBox->AddText(Form("R = %.3f #pm %.3f fm",
-                     levy_pions->GetParameter(1),
-                     levy_pions->GetParError(1)));
-
-fitBox->AddText(Form("#lambda = %.3f #pm %.3f",
-                     levy_pions->GetParameter(2),
-                     levy_pions->GetParError(2)));
-
-fitBox->AddText(Form("#chi^{2}/NDF = %.2f / %.0f", chi2, NDF));
-
-fitBox->AddText(Form("C.L. = %.2f%%", CL));
-
-fitBox->AddText(" ");
-
-    fitBox->Draw();
-    
-
-    
-   //loading fit results
+//loading fit results
 fout << setw(12) << Form("%.2f-%.2f", kT_min, kT_max)
-     << setw(20) << Form("%.5f±%.5f", levy_pions->GetParameter(0), levy_pions->GetParError(0))
-     << setw(20) << Form("%.5f±%.5f", levy_pions->GetParameter(1), levy_pions->GetParError(1))
-     << setw(20) << Form("%.5f±%.5f", levy_pions->GetParameter(2), levy_pions->GetParError(2))
+     << setw(20) << Form("%.5f±%.5f", levy->GetParameter(0), levy->GetParError(0))
+     << setw(20) << Form("%.5f±%.5f", levy->GetParameter(1), levy->GetParError(1))
+     << setw(20) << Form("%.5f±%.5f", levy->GetParameter(2), levy->GetParError(2))
      << setw(10) << Form("%.2f", chi2)
-     << setw(10) << Form("%.0f", NDF)
+     << setw(10) << Form("%.0f", ndf)
      << setw(10) << Form("%.3f", CL)
      << "\n";
 
