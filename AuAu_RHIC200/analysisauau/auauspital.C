@@ -146,7 +146,7 @@ TH1F* AnalyzePairs(const vector<Particle>& particles,
 
 const int n_bins = 150;
 double rho_min = 0.7;
-double rho_max = 45.0;
+double rho_max = 40.0;
 
  double bins[n_bins + 1];
     
@@ -242,12 +242,7 @@ hRho->Sumw2();
 // =========================================
 // Convert Counts to 3D Density D(rho)
 // =========================================
-// =========================================
-// Convert Counts to 3D Density D(rho)
-// =========================================
-
-// Use ONLY physical bins (exclude under/overflow)
-double total_pairs = hRho->Integral(1, hRho->GetNbinsX());
+double total_pairs = hRho->Integral(1, hRho->GetNbinsX()+1);
 
 for (int i = 1; i <= hRho->GetNbinsX(); i++)
 {
@@ -315,18 +310,41 @@ fout << "=======================================================================
      << setw(17) << "lambda"
      << setw(15) << "chi2"
      << setw(12) << "NDF"
-     << setw(12) << "C.L."
+     << setw(14) << "C.L. percent"
      << "\n";
 
     // =========================================
     // Analyze pion pairs
     // =========================================
-    vector<double> kT_bins = {0.25,0.33,0.38,0.40,0.45};
-//{0.10,0.15,0.20,0.25,0.33,0.38,0.40,0.45,0.50,0.55};
+    vector<double> kT_bins;
+
+double kT_min_val = 0.175;
+double kT_max_val = 0.725;
+double step = 0.05;
+
+for(double k = kT_min_val; k <= kT_max_val + 1e-6; k += step)
+{
+    kT_bins.push_back(k);
+}
 
 int nBins = kT_bins.size()-1;
 myLevy_reader = new Levy_reader("levy_proj3D_values.dat");
 
+//storing the mt vs fitting paramters 
+vector<double> mt_vals, mt_err;
+vector<double> alpha_vals, alpha_err;
+vector<double> R_vals, R_err;
+vector<double> N_vals, N_err;
+
+//vector<double> R_scan, lambda_scan, rho_max_vals;
+//vector<int> N_scan;
+
+map<double, vector<double>> R_map;
+map<double, vector<double>> R_map_err;
+map<double, vector<double>> lambda_map;
+map<double, vector<double>> lambda_map_err;
+map<double, vector<double>> chi2_map;
+map<double, vector<double>> rho_map;
 
 for(int ibin=0; ibin<nBins; ibin++)
 {
@@ -380,7 +398,7 @@ hRho_pions->SetMaximum(max_val*2);
 // Initialize Levy reader object
 
 
-TF1 *levy = new TF1("levy", LevySource3D, 0.7, 45.0, 3);
+TF1 *levy = new TF1("levy", LevySource3D, 0.7, 40.0, 3);
 
 levy->SetParNames("alpha","R","N");
 
@@ -399,37 +417,111 @@ double fit_min = 1.0;
 double fit_max = 30.0;
 hRho_pions->Fit(levy, "RM", "", fit_min, fit_max);
 
-// Retrieve fit results
+// stat. check
 double chi2   = levy->GetChisquare();
 double ndf    = levy->GetNDF();
 double chi2ndf = chi2 / ndf;
 double CL     = TMath::Prob(chi2, ndf);
 
+// Compute mean kT and mT
+double kT_mean = 0.5 * (kT_min + kT_max);
+double mpi = 0.13957;
+double mT = sqrt(kT_mean*kT_mean + mpi*mpi);
+
+// Store values
+mt_vals.push_back(mT);
+mt_err.push_back(0.0); 
+
+alpha_vals.push_back(levy->GetParameter(0));
+alpha_err.push_back(levy->GetParError(0));
+
+R_vals.push_back(levy->GetParameter(1));
+R_err.push_back(levy->GetParError(1));
+
+N_vals.push_back(levy->GetParameter(2));
+N_err.push_back(levy->GetParError(2));
+
+// =============================================
+// Stability scan for levy fitting parameters
+// =============================================
+vector<int> N_events_list = {10,30,100,300,1000,3000,10000};
+vector<double> rho_min_list = {0.5, 0.7, 1.0};
+vector<double> B_values = {1600,2500, 3600};
+
+vector<TF1*> scan_functions;
+
+int idx = 0;
+
+for(double rho_min_scan : rho_min_list)
+{
+    for(double B : B_values)
+    {
+        double rho_max_val = sqrt(B / mT);
+
+        for(int N_events : N_events_list)
+        {
+            TF1* levy_scan = new TF1(
+                Form("levy_scan_%d", idx++),
+                LevySource3D,
+                rho_min_scan,
+                rho_max_val,
+                3
+            );
+
+            levy_scan->SetParameters(1.7,4.5,1.0);
+
+            // Fit in scan range
+            hRho_pions->Fit(levy_scan, "QRM", "", rho_min_scan, rho_max_val);
+
+            // Style
+            levy_scan->SetLineStyle(2); // dashed
+            levy_scan->SetLineColor(kRed + (idx % 5));
+            levy_scan->SetLineWidth(1);
+
+         double chi2_scan = levy_scan->GetChisquare();
+         double ndf_scan  = levy_scan->GetNDF();
+
+        double chi2ndf_scan = (ndf_scan > 0) ? chi2_scan / ndf_scan : 0;
+
+// store per rho_min
+R_map[rho_min_scan].push_back(levy_scan->GetParameter(1));
+R_map_err[rho_min_scan].push_back(levy_scan->GetParError(1));
+lambda_map[rho_min_scan].push_back(levy_scan->GetParameter(2));
+lambda_map_err[rho_min_scan].push_back(levy_scan->GetParError(2));
+chi2_map[rho_min_scan].push_back(chi2ndf_scan);
+rho_map[rho_min_scan].push_back(rho_max_val);
+
+            scan_functions.push_back(levy_scan);
+        }
+    }
+}
 // ----- Create two drawing functions -----
-
-// 1. Full curve (extrapolated) – start at 0.9 to avoid reader instability at <0.5
-TF1* f_full = new TF1("f_full", LevySource3D, 0.7, 45.0, 3); 
-f_full->SetParameters(levy->GetParameters()); // Sync params with fit
+// Global fit curves
+TF1* f_full = new TF1("f_full", LevySource3D, 0.7, 40.0, 3);
+f_full->SetParameters(levy->GetParameters());
 f_full->SetLineColor(kRed);
-f_full->SetLineStyle(2); // Dashed
+f_full->SetLineStyle(2);
 f_full->SetLineWidth(2);
-f_full->SetNpx(5000);    // High resolution for log-x smoothness
+f_full->SetNpx(5000);
 
-// 2. Fitted region – solid line
 TF1* f_fit = new TF1("f_fit", LevySource3D, 1.0, 30.0, 3);
 f_fit->SetParameters(levy->GetParameters());
 f_fit->SetLineColor(kRed);
-f_fit->SetLineStyle(1); // Solid
+f_fit->SetLineStyle(1);
 f_fit->SetLineWidth(3);
 f_fit->SetNpx(1000);
 
-// ----- Draw everything -----
-hRho_pions->SetMinimum(1e-11); // Set slightly below the function floor
-hRho_pions->SetMaximum(max_val * 5);
-hRho_pions->Draw("P");          // Draw data points
-f_full->Draw("SAME");           // Draw dashed line underneath
-f_fit->Draw("SAME");            // Draw solid line on top
+hRho_pions->Draw("P");
 
+// Global fit
+f_full->Draw("SAME");
+f_fit->Draw("SAME");
+
+// Scan fits
+for(auto f : scan_functions)
+{
+    f->Draw("SAME");
+}
 // Print results to console
 cout << "\npion pairs Levy fit of AU-AU collision, levy fit:" << endl;
 cout << "alpha = " << levy->GetParameter(0) << " ± " << levy->GetParError(0) << endl;
@@ -442,9 +534,8 @@ cout << "chi2/NDF = " << chi2 << "/" << ndf << "  C.L. = " << CL << endl;
 TLegend* leg = new TLegend(0.60, 0.15, 0.90, 0.35);
 leg->SetBorderSize(0);
 leg->SetFillStyle(0);
-leg->AddEntry(hRho_pions, "Identical pion pairs", "PE");
-leg->AddEntry(f_fit,      "Levy fit (fitted range)", "L");
-leg->AddEntry(f_full,     "Levy fit (extrapolated)", "L");
+leg->AddEntry(hRho_pions, " pion pairs", "PE");
+leg->AddEntry(f_fit,      "Levy fit", "L");
 leg->Draw();
 
 // ----- Title -----
@@ -452,10 +543,10 @@ TLatex* title = new TLatex();
 title->SetNDC();
 title->SetTextFont(42);
 title->SetTextSize(0.045);
-title->DrawLatex(0.15, 0.92, "Levy fit, Grid interpolation Approach");
+
 
 // ----- Information box -----
-TPaveText* infoBox = new TPaveText(0.60, 0.65, 0.95, 0.85, "NDC");
+TPaveText* infoBox = new TPaveText(0.60, 0.65, 0.99, 0.85, "NDC");
 infoBox->SetTextSize(0.035);
 infoBox->SetFillColor(0);
 infoBox->SetBorderSize(1);
@@ -469,7 +560,7 @@ infoBox->AddText(Form("  %.2f < k_{T}[GeV/c] < %.2f", kT_min, kT_max));
 infoBox->Draw();
 
 // ----- Fit results box -----
-TPaveText* fitBox = new TPaveText(0.15, 0.60, 0.45, 0.85, "NDC");
+TPaveText* fitBox = new TPaveText(0.15, 0.60, 0.35, 0.85, "NDC");
 fitBox->SetFillColor(0);
 fitBox->SetBorderSize(1);
 fitBox->SetTextFont(42);
@@ -484,13 +575,13 @@ fitBox->AddText(Form("C.L. = %.2f%%", CL * 100));
 fitBox->Draw();
 
 //loading fit results
-fout << setw(12) << Form("%.2f-%.2f", kT_min, kT_max)
+fout << setw(12) << Form("%.3f-%.3f", kT_min, kT_max)
      << setw(20) << Form("%.5f±%.5f", levy->GetParameter(0), levy->GetParError(0))
      << setw(20) << Form("%.5f±%.5f", levy->GetParameter(1), levy->GetParError(1))
      << setw(20) << Form("%.5f±%.5f", levy->GetParameter(2), levy->GetParError(2))
      << setw(10) << Form("%.2f", chi2)
      << setw(10) << Form("%.0f", ndf)
-     << setw(10) << Form("%.3f", CL)
+     << setw(13) << Form("%.5f%%", CL*100)
      << "\n";
 
        // Save canvas as PNG and also to ROOT file
@@ -501,6 +592,161 @@ fout << setw(12) << Form("%.2f-%.2f", kT_min, kT_max)
     fout.close();
     outFile->Close();
     
+    // mt v.s. fitting paramters canvas 
+    TCanvas* cSummary = new TCanvas("cSummary","Fit Parameters vs mT",1200,900);
+cSummary->Divide(2,2);
+
+// Convert to arrays (needed for TGraphErrors)
+int n = mt_vals.size();
+
+// -------- alpha --------
+cSummary->cd(1);
+TGraphErrors* gAlpha = new TGraphErrors(n,
+    &mt_vals[0], &alpha_vals[0],
+    &mt_err[0],  &alpha_err[0]);
+
+gAlpha->SetTitle("#alpha vs m_{T}; m_{T} [GeV]; #alpha");
+gAlpha->SetMarkerStyle(20);
+gAlpha->Draw("AP");
+
+// -------- R --------
+cSummary->cd(2);
+TGraphErrors* gR = new TGraphErrors(n,
+    &mt_vals[0], &R_vals[0],
+    &mt_err[0],  &R_err[0]);
+
+gR->SetTitle("R vs m_{T}; m_{T} [GeV]; R [fm]");
+gR->SetMarkerStyle(21);
+gR->Draw("AP");
+
+// -------- N (lambda) --------
+cSummary->cd(3);
+
+TGraphErrors* gN = new TGraphErrors(n,
+    &mt_vals[0], &N_vals[0],
+    &mt_err[0],  &N_err[0]);
+
+gN->SetTitle("#lambda vs m_{T}; m_{T} [GeV]; #lambda");
+gN->SetMarkerStyle(22);
+
+gN->Draw("AP");   // Draw FIRST
+
+// the 4th pad
+cSummary->cd(4);
+
+// Optional: clean look
+gPad->SetFillColor(0);
+gPad->SetFrameBorderMode(0);
+
+// Create info box
+TPaveText* infoBox = new TPaveText(0.10, 0.10, 0.90, 0.90, "NDC");
+
+infoBox->SetTextSize(0.05);
+infoBox->SetFillColor(0);
+infoBox->SetBorderSize(1);
+infoBox->SetTextFont(42);
+infoBox->SetTextAlign(12);
+
+// Add text
+infoBox->AddText("System Information");
+infoBox->AddText("---------------------------");
+
+infoBox->AddText(Form("%s", collision_system));
+infoBox->AddText(Form("#sqrt{s_{NN}} = %.0f GeV", sqrt_sNN));
+infoBox->AddText(Form("Centrality: %s", centrality));
+
+infoBox->AddText(" ");
+infoBox->AddText("Kinematic cuts:");
+
+infoBox->AddText(Form("%.2f < p_{T} < %.2f GeV/c", pT_min, pT_max));
+infoBox->AddText(Form("|#eta| < %.1f", eta_cut));
+double rhorangmax = 30;
+double rhorangmin = 1;
+infoBox->AddText(Form("%.1f < #rho < %.1f fm",rhorangmin, rhorangmax));
+
+infoBox->Draw();
+
+// stability check canvas 
+// -------------------
+auto DrawRhoMinGraphs= [](const std::map<double,std::vector<double>>& values_map,
+                         const std::map<double,std::vector<double>>& errors_map,
+                         const std::map<double,std::vector<double>>& rho_map,
+                         const std::string& yTitle,
+                         const std::string& fileName,
+                         const std::vector<double>& rho_min_list)
+{
+    TCanvas* c = new TCanvas(Form("c_%s", fileName.c_str()),
+                             Form("%s vs #rho_{max}", yTitle.c_str()), 1200, 900);
+    c->Divide(2,2);
+
+    std::vector<int> colors = {kRed, kBlue, kGreen+2};
+    int pad = 1;
+
+    for(double rho_min : rho_min_list)
+    {
+        c->cd(pad);
+
+        const auto &vals    = values_map.at(rho_min);
+        const auto &yerrs   = errors_map.at(rho_min);
+        const auto &rhovals = rho_map.at(rho_min);
+
+        int n = vals.size();
+        if(n == 0) continue;
+
+        TGraphErrors* g = new TGraphErrors(n,
+                                           &rhovals[0], &vals[0],
+                                           nullptr, &yerrs[0]);
+
+        g->SetTitle(Form("%s vs #rho_{max}, #rho_{min}=%.1f", yTitle.c_str(), rho_min));
+        g->GetXaxis()->SetTitle("#rho_{max} [fm]");
+        g->GetYaxis()->SetTitle(yTitle.c_str());
+        g->SetMarkerStyle(20);
+        g->SetMarkerColor(colors[(pad-1) % colors.size()]);
+        g->SetLineColor(colors[(pad-1) % colors.size()]);
+        g->SetLineWidth(2);
+
+        g->Draw("AP");
+         // Add legend inside this pad
+        TLegend* leg = new TLegend(0.65, 0.75, 0.90, 0.90); // upper-right
+        leg->SetBorderSize(0);
+        leg->SetFillStyle(0);
+        leg->AddEntry(g, Form("#rho_{min} = %.1f", rho_min), "LP");
+        leg->Draw();
+
+        pad++;
+    }
+
+    if(pad <= 4) {
+        c->cd(pad);
+        gPad->SetFillColor(0);
+        gPad->SetFrameBorderMode(0);
+        TPaveText* infoBox = new TPaveText(0.1,0.1,0.9,0.9,"NDC");
+     
+infoBox->AddText("System Information");
+infoBox->AddText("---------------------------");
+
+infoBox->AddText(Form("%s", collision_system));
+infoBox->AddText(Form("#sqrt{s_{NN}} = %.0f GeV", sqrt_sNN));
+infoBox->AddText(Form("Centrality: %s", centrality));
+
+infoBox->AddText(" ");
+infoBox->AddText("Kinematic cuts:");
+
+infoBox->AddText(Form("%.2f < p_{T} < %.2f GeV/c", pT_min, pT_max));
+infoBox->AddText(Form("|#eta| < %.1f", eta_cut));
+infoBox->Draw();
+    }
+
+    c->SaveAs(Form("%s.png", fileName.c_str()));
+    c->Write();
+};
+std::vector<double> rho_min_list = {0.5, 0.7, 1.0};
+
+// Canvas for R vs rho_max (each rho_min in a separate pad)
+DrawRhoMinGraphs(R_map, R_map_err, rho_map, "R [fm]", "R_vs_rhomax_2x2", rho_min_list);
+
+// Canvas for lambda vs rho_max (each rho_min in a separate pad)
+DrawRhoMinGraphs(lambda_map, lambda_map_err, rho_map, "#lambda", "lambda_vs_rhomax_2x2", rho_min_list);
 
     cout << "\n========================================" << endl;
     cout << "Output files created:" << endl;
@@ -509,3 +755,4 @@ fout << setw(12) << Form("%.2f-%.2f", kT_min, kT_max)
     cout << "========================================" << endl;
     
 }
+
