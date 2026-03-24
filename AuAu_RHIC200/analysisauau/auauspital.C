@@ -377,10 +377,6 @@ hRho_pions->SetMarkerColor(kRed);
 hRho_pions->SetMarkerStyle(20);
 hRho_pions->SetMarkerSize(0.8);
 
-
-
-
-
 // Axis labels
 hRho_pions->GetXaxis()->SetTitle("#rho [fm]");
 hRho_pions->GetYaxis()->SetTitle("D(#rho)");
@@ -411,8 +407,6 @@ levy->SetParLimits(0, 0.5, 2.0);   // alpha
 levy->SetParLimits(1, 2.0, 15.0);  // R
 levy->SetParLimits(2, 0.5, 2.0);   // N
 
-
- 	
 double fit_min = 1.0;
 double fit_max = 30.0;
 hRho_pions->Fit(levy, "RM", "", fit_min, fit_max);
@@ -668,6 +662,7 @@ infoBox->Draw();
 
 // stability check canvas 
 // -------------------
+// Draw multiple rho_min graphs in a 2x2 canvas
 auto DrawRhoMinGraphs= [](const std::map<double,std::vector<double>>& values_map,
                          const std::map<double,std::vector<double>>& errors_map,
                          const std::map<double,std::vector<double>>& rho_map,
@@ -716,6 +711,7 @@ auto DrawRhoMinGraphs= [](const std::map<double,std::vector<double>>& values_map
         pad++;
     }
 
+    // Optional: add info/legend in the last pad if less than 4 graphs
     if(pad <= 4) {
         c->cd(pad);
         gPad->SetFillColor(0);
@@ -743,10 +739,10 @@ infoBox->Draw();
 std::vector<double> rho_min_list = {0.5, 0.7, 1.0};
 
 // Canvas for R vs rho_max (each rho_min in a separate pad)
-DrawRhoMinGraphs(R_map, R_map_err, rho_map, "R [fm]", "R_vs_rhomax_2x2", rho_min_list);
+DrawRhoMinGraphs(R_map, R_map_err, rho_map, "R [fm]", "R_vs_rhomax", rho_min_list);
 
 // Canvas for lambda vs rho_max (each rho_min in a separate pad)
-DrawRhoMinGraphs(lambda_map, lambda_map_err, rho_map, "#lambda", "lambda_vs_rhomax_2x2", rho_min_list);
+DrawRhoMinGraphs(lambda_map, lambda_map_err, rho_map, "#lambda", "lambda_vs_rhomax", rho_min_list);
 
     cout << "\n========================================" << endl;
     cout << "Output files created:" << endl;
