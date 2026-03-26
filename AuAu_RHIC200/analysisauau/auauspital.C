@@ -275,7 +275,7 @@ hRho->SetMinimum(1e-12);
 // ===============================
 // Main function
 // ===============================
-void auaubackref() {
+void auauspital() {
     gStyle->SetOptStat(0);
     gStyle->SetOptTitle(0);
     TH1::AddDirectory(kFALSE);
@@ -335,16 +335,16 @@ vector<double> mt_vals, mt_err;
 vector<double> alpha_vals, alpha_err;
 vector<double> R_vals, R_err;
 vector<double> N_vals, N_err;
+vector<double> B_values = {1600,2500, 3600};
 
-//vector<double> R_scan, lambda_scan, rho_max_vals;
-//vector<int> N_scan;
 
-map<double, vector<double>> R_map;
-map<double, vector<double>> R_map_err;
-map<double, vector<double>> lambda_map;
-map<double, vector<double>> lambda_map_err;
+map<double, map<double, vector<double>>> R_map;
+map<double, map<double, vector<double>>> R_map_err;
+map<double, map<double, vector<double>>> rho_map;
+map<double, map<double, vector<double>>> lambda_map;
+map<double, map<double, vector<double>>> lambda_map_err;
 map<double, vector<double>> chi2_map;
-map<double, vector<double>> rho_map;
+
 
 for(int ibin=0; ibin<nBins; ibin++)
 {
@@ -409,7 +409,7 @@ levy->SetParLimits(2, 0.5, 2.0);   // N
 
 double fit_min = 1.0;
 double fit_max = 30.0;
-hRho_pions->Fit(levy, "RM", "", fit_min, fit_max);
+hRho_pions->Fit(levy, "QRN", "", fit_min, fit_max);
 
 // stat. check
 double chi2   = levy->GetChisquare();
@@ -440,7 +440,7 @@ N_err.push_back(levy->GetParError(2));
 // =============================================
 vector<int> N_events_list = {10,30,100,300,1000,3000,10000};
 vector<double> rho_min_list = {0.5, 0.7, 1.0};
-vector<double> B_values = {1600,2500, 3600};
+
 
 vector<TF1*> scan_functions;
 
@@ -465,12 +465,12 @@ for(double rho_min_scan : rho_min_list)
             levy_scan->SetParameters(1.7,4.5,1.0);
 
             // Fit in scan range
-            hRho_pions->Fit(levy_scan, "QRM", "", rho_min_scan, rho_max_val);
+            hRho_pions->Fit(levy_scan, "QRN", "", rho_min_scan, rho_max_val);
 
-            // Style
-            levy_scan->SetLineStyle(2); // dashed
-            levy_scan->SetLineColor(kRed + (idx % 5));
-            levy_scan->SetLineWidth(1);
+           /* levy_scan->SetLineStyle(2); // dashed
+            levy_scan->SetLineColor(kBlue);
+            levy_scan->SetLineWidth(1);*/
+          
 
          double chi2_scan = levy_scan->GetChisquare();
          double ndf_scan  = levy_scan->GetNDF();
@@ -478,12 +478,20 @@ for(double rho_min_scan : rho_min_list)
         double chi2ndf_scan = (ndf_scan > 0) ? chi2_scan / ndf_scan : 0;
 
 // store per rho_min
-R_map[rho_min_scan].push_back(levy_scan->GetParameter(1));
-R_map_err[rho_min_scan].push_back(levy_scan->GetParError(1));
-lambda_map[rho_min_scan].push_back(levy_scan->GetParameter(2));
-lambda_map_err[rho_min_scan].push_back(levy_scan->GetParError(2));
+
+R_map[rho_min_scan][B].push_back(levy_scan->GetParameter(1));
+R_map_err[rho_min_scan][B].push_back(levy_scan->GetParError(1));
+rho_map[rho_min_scan][B].push_back(rho_max_val);
+lambda_map[rho_min_scan][B].push_back(levy_scan->GetParameter(2));
+lambda_map_err[rho_min_scan][B].push_back(levy_scan->GetParError(2));
+
+//R_map[rho_min_scan].push_back(levy_scan->GetParameter(1));
+//R_map_err[rho_min_scan].push_back(levy_scan->GetParError(1));
+//lambda_map[rho_min_scan].push_back(levy_scan->GetParameter(2));
+//lambda_map_err[rho_min_scan].push_back(levy_scan->GetParError(2));
+
 chi2_map[rho_min_scan].push_back(chi2ndf_scan);
-rho_map[rho_min_scan].push_back(rho_max_val);
+//rho_map[rho_min_scan].push_back(rho_max_val);
 
             scan_functions.push_back(levy_scan);
         }
@@ -491,7 +499,7 @@ rho_map[rho_min_scan].push_back(rho_max_val);
 }
 // ----- Create two drawing functions -----
 // Global fit curves
-TF1* f_full = new TF1("f_full", LevySource3D, 0.7, 40.0, 3);
+TF1* f_full = new TF1("f_full", LevySource3D, 0.5, 40.0, 3);
 f_full->SetParameters(levy->GetParameters());
 f_full->SetLineColor(kRed);
 f_full->SetLineStyle(2);
@@ -512,10 +520,10 @@ f_full->Draw("SAME");
 f_fit->Draw("SAME");
 
 // Scan fits
-for(auto f : scan_functions)
+/*for(auto f : scan_functions)
 {
     f->Draw("SAME");
-}
+}*/
 // Print results to console
 cout << "\npion pairs Levy fit of AU-AU collision, levy fit:" << endl;
 cout << "alpha = " << levy->GetParameter(0) << " ± " << levy->GetParError(0) << endl;
@@ -525,11 +533,12 @@ cout << "chi2/NDF = " << chi2 << "/" << ndf << "  C.L. = " << CL << endl;
 
 
 // ----- Legend -----
-TLegend* leg = new TLegend(0.60, 0.15, 0.90, 0.35);
+TLegend* leg = new TLegend(0.60, 0.20, 0.90, 0.40);
 leg->SetBorderSize(0);
 leg->SetFillStyle(0);
 leg->AddEntry(hRho_pions, " pion pairs", "PE");
-leg->AddEntry(f_fit,      "Levy fit", "L");
+leg->AddEntry(f_fit,      "Levy fit (1-30 fm)", "L");
+leg->AddEntry(f_full,      "Levy fit (0.5-40 fm)", "L");
 leg->Draw();
 
 // ----- Title -----
@@ -538,7 +547,7 @@ title->SetNDC();
 title->SetTextFont(42);
 title->SetTextSize(0.045);
 
-
+gPad->GetListOfPrimitives()->Print();
 // ----- Information box -----
 TPaveText* infoBox = new TPaveText(0.60, 0.65, 0.99, 0.85, "NDC");
 infoBox->SetTextSize(0.035);
@@ -554,7 +563,8 @@ infoBox->AddText(Form("  %.2f < k_{T}[GeV/c] < %.2f", kT_min, kT_max));
 infoBox->Draw();
 
 // ----- Fit results box -----
-TPaveText* fitBox = new TPaveText(0.15, 0.60, 0.35, 0.85, "NDC");
+TPaveText* fitBox = new TPaveText(0.20, 0.50, 0.50, 0.75, "NDC");
+//TPaveText* fitBox = new TPaveText(0.15, 0.60, 0.45, 0.85, "NDC");
 fitBox->SetFillColor(0);
 fitBox->SetBorderSize(1);
 fitBox->SetTextFont(42);
@@ -662,57 +672,105 @@ infoBox->Draw();
 
 // stability check canvas 
 // -------------------
-// Draw multiple rho_min graphs in a 2x2 canvas
-auto DrawRhoMinGraphs= [](const std::map<double,std::vector<double>>& values_map,
-                         const std::map<double,std::vector<double>>& errors_map,
-                         const std::map<double,std::vector<double>>& rho_map,
-                         const std::string& yTitle,
-                         const std::string& fileName,
-                         const std::vector<double>& rho_min_list)
+auto DrawRhoMinGraphs = [&](const map<double, map<double, vector<double>>>& values_map,
+                           const map<double, map<double, vector<double>>>& errors_map,
+                           const map<double, map<double, vector<double>>>& rho_map,
+                           const string& yTitle,
+                           const string& fileName,
+                           const vector<double>& rho_min_list,
+                           const vector<double>& B_values)
 {
     TCanvas* c = new TCanvas(Form("c_%s", fileName.c_str()),
                              Form("%s vs #rho_{max}", yTitle.c_str()), 1200, 900);
     c->Divide(2,2);
 
-    std::vector<int> colors = {kRed, kBlue, kGreen+2};
+    vector<int> colors = {kRed, kBlue, kGreen+2};
+
+    // ===== FIXED AXIS RANGES =====
+    double xmin = 40;
+    double xmax = 130;
+
+    double ymin_R = 3.2;
+    double ymax_R = 5.4;
+
     int pad = 1;
 
     for(double rho_min : rho_min_list)
     {
         c->cd(pad);
 
-        const auto &vals    = values_map.at(rho_min);
-        const auto &yerrs   = errors_map.at(rho_min);
-        const auto &rhovals = rho_map.at(rho_min);
-
-        int n = vals.size();
-        if(n == 0) continue;
-
-        TGraphErrors* g = new TGraphErrors(n,
-                                           &rhovals[0], &vals[0],
-                                           nullptr, &yerrs[0]);
-
-        g->SetTitle(Form("%s vs #rho_{max}, #rho_{min}=%.1f", yTitle.c_str(), rho_min));
-        g->GetXaxis()->SetTitle("#rho_{max} [fm]");
-        g->GetYaxis()->SetTitle(yTitle.c_str());
-        g->SetMarkerStyle(20);
-        g->SetMarkerColor(colors[(pad-1) % colors.size()]);
-        g->SetLineColor(colors[(pad-1) % colors.size()]);
-        g->SetLineWidth(2);
-
-        g->Draw("AP");
-         // Add legend inside this pad
-        TLegend* leg = new TLegend(0.65, 0.75, 0.90, 0.90); // upper-right
+        TLegend* leg = new TLegend(0.60, 0.65, 0.88, 0.88);
         leg->SetBorderSize(0);
         leg->SetFillStyle(0);
-        leg->AddEntry(g, Form("#rho_{min} = %.1f", rho_min), "LP");
+
+        int color_idx = 0;
+
+        for(double B : B_values)
+        {
+            const auto& vals = values_map.at(rho_min).at(B);
+            const auto& errs = errors_map.at(rho_min).at(B);
+            const auto& rhos = rho_map.at(rho_min).at(B);
+
+            int n = vals.size();
+            if(n == 0) continue;
+
+            TGraphErrors* g = new TGraphErrors(n,
+                                               &rhos[0], &vals[0],
+                                               nullptr, &errs[0]);
+
+            g->SetMarkerStyle(20 + color_idx);
+            g->SetMarkerColor(colors[color_idx]);
+            g->SetLineColor(colors[color_idx]);
+            g->SetLineWidth(2);
+
+            if(color_idx == 0)
+            {
+                // ===== Titles & axes =====
+                g->SetTitle(Form("%s vs #rho_{max}", yTitle.c_str()));
+                g->GetXaxis()->SetTitle("#rho_{max} [fm]");
+                g->GetYaxis()->SetTitle(yTitle.c_str());
+
+                // ===== FIXED AXES =====
+                g->GetXaxis()->SetLimits(xmin, xmax);
+
+                if(yTitle == "R [fm]")
+                {
+                    g->SetMinimum(ymin_R);
+                    g->SetMaximum(ymax_R);
+                }
+
+                g->Draw("AP");
+            }
+            else
+            {
+                g->Draw("P SAME");
+            }
+
+            leg->AddEntry(g, Form("B = %.0f", B), "LP");
+
+            color_idx++;
+        }
+
         leg->Draw();
+
+        // ===== rho_min box =====
+
+TPaveText* rhoBox = new TPaveText(0.15, 0.75, 0.40, 0.88, "NDC");
+
+rhoBox->SetFillStyle(0);   
+rhoBox->SetBorderSize(0);  
+rhoBox->SetTextFont(43);
+rhoBox->SetTextSize(18);   
+rhoBox->SetTextAlign(12);
+
+rhoBox->AddText(Form("#rho_{min} = %.1f fm", rho_min));
+
+rhoBox->Draw();
 
         pad++;
     }
 
-    // Optional: add info/legend in the last pad if less than 4 graphs
-    if(pad <= 4) {
+if(pad <= 4) {
         c->cd(pad);
         gPad->SetFillColor(0);
         gPad->SetFrameBorderMode(0);
@@ -738,11 +796,13 @@ infoBox->Draw();
 };
 std::vector<double> rho_min_list = {0.5, 0.7, 1.0};
 
-// Canvas for R vs rho_max (each rho_min in a separate pad)
-DrawRhoMinGraphs(R_map, R_map_err, rho_map, "R [fm]", "R_vs_rhomax", rho_min_list);
+DrawRhoMinGraphs(R_map, R_map_err, rho_map,
+                 "R [fm]", "R_vs_rhomax",
+                 rho_min_list, B_values);
 
-// Canvas for lambda vs rho_max (each rho_min in a separate pad)
-DrawRhoMinGraphs(lambda_map, lambda_map_err, rho_map, "#lambda", "lambda_vs_rhomax", rho_min_list);
+DrawRhoMinGraphs(lambda_map, lambda_map_err, rho_map,
+                 "#lambda", "lambda_vs_rhomax",
+                 rho_min_list, B_values);
 
     cout << "\n========================================" << endl;
     cout << "Output files created:" << endl;
