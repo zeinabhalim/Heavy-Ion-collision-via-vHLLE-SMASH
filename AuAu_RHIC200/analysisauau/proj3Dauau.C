@@ -142,7 +142,7 @@ HBTResults AnalyzePairs(const vector<Particle>& particles,
 // =======================
 const int n_bins = 150; 
     double rho_min = 0.7;
-    double rho_max = 40.0;
+    double rho_max = 30.0;
     double bins[n_bins + 1];
     
     double r = pow(rho_max / rho_min, 1.0 / n_bins);
@@ -154,13 +154,13 @@ const int n_bins = 150;
 TH1F* hRho = new TH1F("hRho", "D(#rho)", n_bins, bins);
 hRho->Sumw2();
 
-TH2F* hRhoVsOut  = new TH2F("hRhoVsOut",  "", n_bins, bins, n_bins, bins);
-TH2F* hRhoVsSide = new TH2F("hRhoVsSide", "", n_bins, bins, n_bins, bins);
-TH2F* hRhoVsLong = new TH2F("hRhoVsLong", "", n_bins, bins, n_bins, bins);
+TH1F* hOut  = new TH1F("hOut",  "", n_bins, bins);
+TH1F* hSide = new TH1F("hSide", "", n_bins, bins);
+TH1F* hLong = new TH1F("hLong", "", n_bins, bins);
 
-    hRhoVsOut->Sumw2();
-    hRhoVsSide->Sumw2();
-    hRhoVsLong->Sumw2();
+hOut->Sumw2();
+hSide->Sumw2();
+hLong->Sumw2();
     
     int pairs_count = 0;
     
@@ -234,43 +234,21 @@ TH2F* hRhoVsLong = new TH2F("hRhoVsLong", "", n_bins, bins, n_bins, bins);
                 
                 double rho = sqrt(r_out * r_out + r_side * r_side + r_long * r_long);
                
-                    hRho->Fill(rho);
-                     hRhoVsOut->Fill(fabs(r_out), rho);
-                     hRhoVsSide->Fill(fabs(r_side), rho);
-                   hRhoVsLong->Fill(fabs(r_long), rho);
+                   hRho->Fill(rho);
+                   hOut->Fill(fabs(r_out));
+                   hSide->Fill(fabs(r_side));
+                   hLong->Fill(fabs(r_long));
             }
         }
     }
-
-auto normalize1D = [](TH1F* h) {
-    double total = h->Integral(1, h->GetNbinsX()+1); 
-
-    h->Scale(1.0 / total, "width"); 
-
-    for(int i=1; i<=h->GetNbinsX(); i++) {
-        double content = h->GetBinContent(i);
-        double error   = h->GetBinError(i);
-    }
-};
-
-
-    TH1F* hOut  = (TH1F*) hRhoVsOut->ProjectionX("hOut");
-    TH1F* hSide = (TH1F*) hRhoVsSide->ProjectionX("hSide");
-    TH1F* hLong = (TH1F*) hRhoVsLong->ProjectionX("hLong");
-
 
     HBTResults res;
     res.hOut = hOut; res.hSide = hSide; res.hLong = hLong; res.hRho = hRho;
     res.total_pairs = pairs_count;
 
-    normalize1D(hOut);
-    normalize1D(hSide);
-    normalize1D(hLong);
-
     
     return res;
-
-   
+  
 }
 
 // ---------------------------
@@ -298,7 +276,7 @@ void auau3D()
     vector<double> kT_bins;
 
 double kT_min_val = 0.15;
-double kT_max_val = 0.55;
+double kT_max_val = 0.85;
 double step = 0.05;
 
 for(double k = kT_min_val; k <= kT_max_val + 1e-6; k += step)
@@ -307,8 +285,6 @@ for(double k = kT_min_val; k <= kT_max_val + 1e-6; k += step)
 }
 
 int nBins = kT_bins.size()-1;
-
-    const int NPAR = 7;
 
     // --- Loop over kT bins ---
     for(int ibin = 0; ibin < nBins; ibin++)
@@ -322,53 +298,54 @@ int nBins = kT_bins.size()-1;
         HBTResults res = AnalyzePairs(particles, kT_min, kT_max, true);
 
         // --- Fit range ---
-        const double fit_min = 0.7;
-        const double fit_max = 40.0;
+        const double fit_min = 1.0;
+        double fit_max_x[3] = {20.0, 10.0, 20.0}; // out, side, long
+        const int NPAR = 5;
 
-        // --- Chi2 functor ---
-       struct Chi2Functor {
+struct LogLikelihood {
     HBTResults res;
-    double fit_min, fit_max; 
+    double fit_min, fit_max_x[3];
+    int* pBinsUsed; 
 
-    // constructor to take 3 arguments
-    Chi2Functor(const HBTResults& r, double min, double max) 
-        : res(r), fit_min(min), fit_max(max) {}
-
+    LogLikelihood(const HBTResults& r, double min, const double max_vals[3], int* binPtr)
+        : res(r), fit_min(min), pBinsUsed(binPtr) {
+        for(int i=0; i<3; i++) fit_max_x[i] = max_vals[i];
+    }
+  
     double operator()(const double* p) const {
-        double totalChi2 = 0;
-        TH1F* hists[3] = {res.hOut, res.hSide, res.hLong};
+        double logL = 0.0;
+        int currentBins = 0; 
         
-        double max_fit_x[3] = {fit_max, 30.0, fit_max}; 
+        TH1F* hists[3] = {res.hOut, res.hSide, res.hLong};
 
         for(int i=0; i<3; i++) {
-            double alpha = p[0];
-            double R     = p[i+1];
-            double N     = p[i+4];
-            double pars[3] = {alpha, R, N};
+            double pars[3] = {p[0], p[i+1], p[4]};
+            double integral = hists[i]->Integral(0, hists[i]->GetNbinsX()+1); //NORMALIZATION 
 
             for(int b=1; b <= hists[i]->GetNbinsX(); b++) {
                 double x = hists[i]->GetBinCenter(b);
-                
-                // Use the specific cutoff
-                if(x < fit_min || x > max_fit_x[i]) continue;
-                
-                double obs = hists[i]->GetBinContent(b);
-                double err = hists[i]->GetBinError(b);
-                if(err <= 0) continue;
+                if(x < fit_min || x > fit_max_x[i]) continue;
 
-                double exp = LevyProj1DFunc(&x, pars);
-                totalChi2 += pow((obs - exp)/err, 2);
+                double expected = LevyProj1DFunc(&x, pars) * hists[i]->GetBinWidth(b) * integral;
+                if(expected <= 1e-12) continue;
+
+                double observed = hists[i]->GetBinContent(b);
+                logL += (observed > 0) ? (expected - observed + observed * log(observed/expected)) : expected;
+                currentBins++;
             }
         }
-        return totalChi2;
+        
+        if (pBinsUsed) *pBinsUsed = currentBins; 
+        return logL;
     }
 };
 
+//counting used bins 
+int actualBins = 0; 
+LogLikelihood loglikfunc(res, fit_min, fit_max_x, &actualBins);
+ROOT::Math::Functor f(loglikfunc, NPAR);
 
-        Chi2Functor chi2func(res, fit_min, fit_max);
-        ROOT::Math::Functor f(chi2func, NPAR);
-
-        ROOT::Math::Minimizer* minimizer =
+       ROOT::Math::Minimizer* minimizer =
        ROOT::Math::Factory::CreateMinimizer("Minuit2", "Migrad");
 
         minimizer->SetFunction(f);
@@ -376,32 +353,22 @@ int nBins = kT_bins.size()-1;
         minimizer->SetMaxIterations(50000);
         minimizer->SetTolerance(1e-6);
 
-        // --- Initial parameters ---
+        // --- fitting parameters ---
 minimizer->SetLimitedVariable(0, "alpha", 1.4, 0.05, 0.8, 2.0); 
-
-
 minimizer->SetLimitedVariable(1, "Rout",  4.0, 0.1, 1.0, 20.0);
-minimizer->SetLimitedVariable(2, "Rside", 10.0, 0.1, 1.0, 30.0);
-minimizer->SetLimitedVariable(3, "Rlong", 6.0, 0.1, 1.0, 20.0);
-
-// separate normalizations
-minimizer->SetLimitedVariable(4, "N_out",  0.9, 0.01, 0.0, 5.0);
-minimizer->SetLimitedVariable(5, "N_side", 0.5, 0.01, 0.0, 5.0);
-minimizer->SetLimitedVariable(6, "N_long", 0.9, 0.01, 0.0, 5.0);
+minimizer->SetLimitedVariable(2, "Rside", 2.0, 0.1, 1.0, 20.0);
+minimizer->SetLimitedVariable(3, "Rlong", 5.0, 0.1, 1.0, 20.0);
+minimizer->SetLimitedVariable(4, "N",1.0, 0.05, 0.0, 2.0);
 
         minimizer->Minimize();
 
         const double* p = minimizer->X();
         const double* err = minimizer->Errors();
-        double chi2 = minimizer->MinValue();
-        int nPoints = res.hOut->GetNbinsX() + res.hSide->GetNbinsX() + res.hLong->GetNbinsX();
-        int nPar = 7;
-       int ndf = nPoints - nPar;
-         cout << " chi2/NDF = " << chi2 << "/" << ndf << endl;
+       double chi2 =  minimizer->MinValue(); 
+       int ndf = actualBins - NPAR; 
+       double CL = (ndf > 0) ? TMath::Prob(chi2, ndf) : 0;
 
-        double CL = (ndf>0) ? TMath::Prob(chi2, ndf) : 0;
-
-        // --- Print results ---
+        // --- Print fit results ---
         bool success = minimizer->Status() == 0;
         if (!success) cout << "WARNING: Fit did not converge!" << endl;
 
@@ -410,17 +377,14 @@ minimizer->SetLimitedVariable(6, "N_long", 0.9, 0.01, 0.0, 5.0);
         cout << " Rout  = " << p[1] << " ± " << err[1] << endl;
         cout << " Rside = " << p[2] << " ± " << err[2] << endl;
         cout << " Rlong = " << p[3] << " ± " << err[3] << endl;
-cout << " N_out  = " << p[4] << " ± " << err[4] << endl;
-cout << " N_side = " << p[5] << " ± " << err[5] << endl;
-cout << " N_long = " << p[6] << " ± " << err[6] << endl;
-        cout << " chi²/NDF = " << chi2 << "/" << ndf << " (C.L. = " << CL*100 << "%)" << endl;
+        cout << " N  = " << p[4] << " ± " << err[4] << endl;
+       cout << "-logL/NDF: " << chi2 << "/" << ndf << " (CL: " << CL * 100 << ")" << endl;
         
          //check points
       cout << "Pairs in Out: " << res.hOut->GetEntries() << endl;
       cout << "Pairs in Side: " << res.hSide->GetEntries() << endl;
       cout << "Pairs in Long: " << res.hLong->GetEntries() << endl;
-
-
+      
         // --- Plot ---
         TCanvas* c = new TCanvas(Form("c_%d", ibin),
                                  Form("kT: %.2f-%.2f GeV/c, N_{pairs} = %d",
@@ -431,41 +395,37 @@ cout << " N_long = " << p[6] << " ± " << err[6] << endl;
         TH1F* hdir[3] = {res.hOut, res.hSide, res.hLong};
         const char* names[3] = {"out", "side", "long"};
 
-        double xmin[3] = {0.7, 0.7, 0.7};
-        double xmax[3] = {35.0, 25.0, 35.0};
-        double ymin[3] = {1e-5, 1e-5, 1e-5};
-        double ymax[3] = {100, 100, 100};
-
         for (int idir = 0; idir < 3; ++idir) {
-            c->cd(idir+1);
-            gPad->SetLogx();
-            gPad->SetLogy();
+               c->cd(idir+1);
+               gPad->SetLogx();
+               gPad->SetLogy();
 
-            TH1F* h = hdir[idir];
+               TH1F* h = hdir[idir];
+               
+          // scalling 
+          h->Scale(1.0 / h->Integral(), "width");
+          
+           // Set the Range and Axis limits
+           double xmin[3] = {0.8 , 0.8, 0.8};
+           double xmax[3] = {30 , 30, 30};
+            h->GetXaxis()->SetRangeUser(xmin[idir], xmax[idir]);
+            h->SetMinimum(1e-4);  
+            h->SetMaximum(1.0);  
             h->SetMarkerStyle(20);
             h->SetMarkerSize(0.8);
-
-            h->GetXaxis()->SetRangeUser(xmin[idir], xmax[idir]);
-
-            // Compute y-axis max
-            double maxy = 0;
-            for (int ib = 1; ib <= h->GetNbinsX(); ++ib) {
-                double x = h->GetXaxis()->GetBinCenter(ib);
-                if (x < xmin[idir] || x > xmax[idir]) continue;
-                double y = h->GetBinContent(ib);
-                if (y > maxy) maxy = y;
-            }
-           
-            h->Draw("E");
             
+            h ->GetYaxis()->SetTitle("D(#rho)");
             res.hOut ->GetXaxis()->SetTitle("#rho_{out} [fm]");
             res.hSide->GetXaxis()->SetTitle("#rho_{side} [fm]");
-             res.hLong->GetXaxis()->SetTitle("#rho_{long} [fm]");
+            res.hLong->GetXaxis()->SetTitle("#rho_{long} [fm]");
+            
+            h->Draw("E");
+  
+         //Drawing fit function
+          double R_par[3] = {p[1], p[2], p[3]}; // Rout, Rside, Rlong
+          double N = p[4]; 
+          double par[3] = {p[0], R_par[idir], N };
 
-            h ->GetYaxis()->SetTitle("D(#rho)");
-
-            // Draw Levy fit
-            double par[3] = {p[0], p[idir+1], p[idir+4]};
             TF1* flevy = new TF1(Form("f_%s_%d", names[idir], ibin),
                                  LevyProj1DFunc, xmin[idir], xmax[idir], 3);
             flevy->SetParameters(par);
@@ -473,17 +433,16 @@ cout << " N_long = " << p[6] << " ± " << err[6] << endl;
             flevy->SetLineWidth(3);
             flevy->Draw("SAME");
 
-            // Parameter box
+            // fit Parameter box
             TPaveText* box = new TPaveText(0.15,0.55,0.50,0.88,"NDC");
             box->SetFillColor(0);
             box->SetTextSize(0.035);
             box->AddText(Form("#alpha = %.3f #pm %.3f", p[0], err[0]));
             box->AddText(Form("R_{%s} = %.2f #pm %.2f fm", names[idir], p[idir+1], err[idir+1]));
-            box->AddText(Form("#lambda_{%s} = %.2f #pm %.2f", names[idir], p[idir+1], err[idir+1]));
+            box->AddText(Form("#lambda = %.2f #pm %.2f", p[4], err[4]));
             box->AddText(Form("#chi^{2}/NDF = %.2f / %.d", chi2, ndf));
-            box->AddText(Form("C.L. = %.2f%%", CL*100));
+            box->AddText(Form("C.L. = %.4f%%", CL *100));
                        
-
             box->Draw();
         }
 
