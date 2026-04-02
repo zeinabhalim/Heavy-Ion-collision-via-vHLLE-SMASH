@@ -130,7 +130,8 @@ TH1F* AnalyzePairs(const vector<Particle>& particles,
                    double kT_max,
                    bool pions_only,
                    const char* hist_name,
-                   const char* hist_title)
+                   const char* hist_title,
+                   int &pairs_count_out)
 {
     
     // Group particles by event
@@ -145,7 +146,7 @@ TH1F* AnalyzePairs(const vector<Particle>& particles,
 // =======================
 
 const int n_bins = 150;
-double rho_min = 0.7;
+double rho_min = 0.5;
 double rho_max = 40.0;
 
  double bins[n_bins + 1];
@@ -236,6 +237,8 @@ hRho->Sumw2();
                 double rho = sqrt(r_out * r_out + r_side * r_side + r_long * r_long);
                 
                 hRho->Fill(rho);
+  
+
             }
         }
     }
@@ -263,19 +266,184 @@ for (int i = 1; i <= hRho->GetNbinsX(); i++)
     }
 }
 
-// Safety for log plots
-hRho->SetMinimum(1e-12);
+     // Safety for log plots
+     //hRho->SetMinimum(1e-12);
+     
+     pairs_count_out = pairs_count;
     cout << (pions_only ? "Pion pairs: " : "All pairs: ") << pairs_count << " pairs analyzed" << endl;
 
     return hRho;
 }
 
+void Draw_R_vs_mT_3Pads(
+    map<double, map<double, vector<double>>>& Rmap,
+    map<double, map<double, vector<double>>>& Rerrmap,
+    map<double, map<double, vector<double>>>& mTmap,
+    vector<double>& rho_min_list,
+    vector<double>& B_values)
+{
+    TCanvas* c = new TCanvas("c_R_mT_3pads","R vs mT",1200,400);
+    c->Divide(3,1);
 
+    vector<int> colors = {kRed, kBlue, kGreen+2};
+
+    for(int i_rho = 0; i_rho < rho_min_list.size(); i_rho++)
+    {
+        double rho_min = rho_min_list[i_rho];
+
+        c->cd(i_rho+1);
+        gPad->SetGrid();
+
+        TLegend* leg = new TLegend(0.50,0.65,0.88,0.88);
+        leg->SetBorderSize(0);
+        leg->SetFillStyle(0);
+
+        bool first = true;
+
+        for(int i_B = 0; i_B < B_values.size(); i_B++)
+        {
+            double B = B_values[i_B];
+
+            auto& Rvals  = Rmap[rho_min][B];
+            auto& Rerrs  = Rerrmap[rho_min][B];
+            auto& mTvals = mTmap[rho_min][B];
+
+            int n = Rvals.size();
+            if(n == 0) continue;
+
+            TGraphErrors* g = new TGraphErrors(
+                n,
+                &mTvals[0],
+                &Rvals[0],
+                nullptr,
+                &Rerrs[0]
+            );
+
+            g->SetMarkerStyle(20 + i_B);
+            g->SetMarkerColor(colors[i_B]);
+            g->SetLineColor(colors[i_B]);
+            g->SetLineWidth(2);
+
+            if(first)
+            {
+                g->SetTitle(Form("#rho_{min} = %.1f; m_{T} [GeV]; R [fm]", rho_min));
+                g->SetMinimum(3.2);
+                g->SetMaximum(5.5);
+                g->Draw("AP");
+                first = false;
+            }
+            else
+            {
+                g->Draw("P SAME");
+            }
+
+            leg->AddEntry(g, Form("B = %.0f", B), "P");
+        }
+
+        leg->Draw();
+        // ===== rho_min label box =====
+TPaveText* rhoBox = new TPaveText(0.15, 0.75, 0.40, 0.88, "NDC");
+
+rhoBox->SetFillStyle(0);
+rhoBox->SetBorderSize(0);
+rhoBox->SetTextFont(43);
+rhoBox->SetTextSize(18);
+rhoBox->SetTextAlign(12);
+
+rhoBox->AddText(Form("#rho_{min} = %.1f fm", rho_min));
+
+rhoBox->Draw();
+    }
+
+    c->SaveAs("R_vs_mT_3pads.png");
+}
+
+void Draw_R_vs_mT_ByB(
+    map<double, map<double, vector<double>>>& Rmap,
+    map<double, map<double, vector<double>>>& Rerrmap,
+    map<double, map<double, vector<double>>>& mTmap,
+    vector<double>& rho_min_list,
+    vector<double>& B_values)
+{
+    int nPads = B_values.size();
+    TCanvas* c = new TCanvas("c_R_mT_ByB","R vs mT by B",1200,400);
+    c->Divide(nPads,1); // One pad per B value
+
+    vector<int> colors = {kRed, kBlue, kGreen+2}; // for rho_min curves
+
+    for(int i_B = 0; i_B < B_values.size(); i_B++)
+    {
+        double B = B_values[i_B];
+
+        c->cd(i_B+1);
+        gPad->SetGrid();
+
+        TLegend* leg = new TLegend(0.55,0.65,0.88,0.88);
+        leg->SetBorderSize(0);
+        leg->SetFillStyle(0);
+
+        bool first = true;
+
+        for(int i_rho = 0; i_rho < rho_min_list.size(); i_rho++)
+        {
+            double rho_min = rho_min_list[i_rho];
+
+            auto& Rvals  = Rmap[rho_min][B];
+            auto& Rerrs  = Rerrmap[rho_min][B];
+            auto& mTvals = mTmap[rho_min][B];
+
+            int n = Rvals.size();
+            if(n == 0) continue;
+
+            TGraphErrors* g = new TGraphErrors(
+                n,
+                &mTvals[0],
+                &Rvals[0],
+                nullptr,
+                &Rerrs[0]
+            );
+
+            g->SetMarkerStyle(20 + i_rho);
+            g->SetMarkerColor(colors[i_rho]);
+            g->SetLineColor(colors[i_rho]);
+            g->SetLineWidth(2);
+
+            if(first)
+            {
+                g->SetTitle(Form("B = %.0f; m_{T} [GeV]; R [fm]", B));
+                g->SetMinimum(3.2);
+                g->SetMaximum(5.5);
+                g->Draw("AP");
+                first = false;
+            }
+            else
+            {
+                g->Draw("P SAME");
+            }
+
+            leg->AddEntry(g, Form("#rho_{min} = %.1f", rho_min), "P");
+        }
+
+        leg->Draw();
+
+        // Optional: B value label box
+        TPaveText* BBox = new TPaveText(0.15, 0.75, 0.40, 0.88, "NDC");
+        BBox->SetFillStyle(0);
+        BBox->SetBorderSize(0);
+        BBox->SetTextFont(43);
+        BBox->SetTextSize(18);
+        BBox->SetTextAlign(12);
+        BBox->AddText(Form("B = %.0f", B));
+        BBox->Draw();
+    }
+
+    c->SaveAs("R_vs_mT_byB.png");
+}
 
 // ===============================
 // Main function
 // ===============================
-void auauspital() {
+void auaubackref() {
     gStyle->SetOptStat(0);
     gStyle->SetOptTitle(0);
     TH1::AddDirectory(kFALSE);
@@ -283,7 +451,7 @@ void auauspital() {
     // =========================================
     // Configuration
     // =========================================
-    const char* oscar_file = "/home/zeinab/Documents/vhlle-smash/hybrid/sampler.out/test_run/particle_lists.oscar";
+    const char* oscar_file = "/home/zeinab/Documents/vhlle-smash/hybrid/AuAu_RHIC200/sampler.out/cent0_5/particle_lists_0.oscar";
     
     // =========================================
     // Load particles
@@ -311,6 +479,7 @@ fout << "=======================================================================
      << setw(15) << "chi2"
      << setw(12) << "NDF"
      << setw(14) << "C.L. percent"
+      << setw(15) << "N_pairs"
      << "\n";
 
     // =========================================
@@ -319,7 +488,7 @@ fout << "=======================================================================
     vector<double> kT_bins;
 
 double kT_min_val = 0.175;
-double kT_max_val = 0.725;
+double kT_max_val = 0.775;
 double step = 0.05;
 
 for(double k = kT_min_val; k <= kT_max_val + 1e-6; k += step)
@@ -337,6 +506,8 @@ vector<double> R_vals, R_err;
 vector<double> N_vals, N_err;
 vector<double> B_values = {1600,2500, 3600};
 
+//vector<double> R_scan, lambda_scan, rho_max_vals;
+//vector<int> N_scan;
 
 map<double, map<double, vector<double>>> R_map;
 map<double, map<double, vector<double>>> R_map_err;
@@ -345,6 +516,10 @@ map<double, map<double, vector<double>>> lambda_map;
 map<double, map<double, vector<double>>> lambda_map_err;
 map<double, vector<double>> chi2_map;
 
+map<double, map<double, vector<double>>> R_vs_mT;
+map<double, map<double, vector<double>>> Rerr_vs_mT;
+map<double, map<double, vector<double>>> mT_map;
+//map<double, vector<double>> rho_map;
 
 for(int ibin=0; ibin<nBins; ibin++)
 {
@@ -353,14 +528,17 @@ for(int ibin=0; ibin<nBins; ibin++)
 
     cout<<"Processing kT: "<<kT_min<<" - "<<kT_max<<endl;
 
-    TH1F* hRho_pions = AnalyzePairs(
-        particles,
-        kT_min,
-        kT_max,
-        true,
-        Form("hRho_pions_%d",ibin),
-        "Pion pairs "
-    );
+    int pion_pairs_count = 0;
+
+TH1F* hRho_pions = AnalyzePairs(
+    particles,
+    kT_min,
+    kT_max,
+    true,
+    Form("hRho_pions_%d",ibin),
+    "Pion pairs",
+    pion_pairs_count
+);
 
    // =========================================
 // Create canvas
@@ -452,8 +630,6 @@ for(double rho_min_scan : rho_min_list)
     {
         double rho_max_val = sqrt(B / mT);
 
-        for(int N_events : N_events_list)
-        {
             TF1* levy_scan = new TF1(
                 Form("levy_scan_%d", idx++),
                 LevySource3D,
@@ -476,6 +652,8 @@ for(double rho_min_scan : rho_min_list)
          double ndf_scan  = levy_scan->GetNDF();
 
         double chi2ndf_scan = (ndf_scan > 0) ? chi2_scan / ndf_scan : 0;
+        
+        
 
 // store per rho_min
 
@@ -485,28 +663,28 @@ rho_map[rho_min_scan][B].push_back(rho_max_val);
 lambda_map[rho_min_scan][B].push_back(levy_scan->GetParameter(2));
 lambda_map_err[rho_min_scan][B].push_back(levy_scan->GetParError(2));
 
-//R_map[rho_min_scan].push_back(levy_scan->GetParameter(1));
-//R_map_err[rho_min_scan].push_back(levy_scan->GetParError(1));
-//lambda_map[rho_min_scan].push_back(levy_scan->GetParameter(2));
-//lambda_map_err[rho_min_scan].push_back(levy_scan->GetParError(2));
+// store per mt
+R_vs_mT[rho_min_scan][B].push_back(levy_scan->GetParameter(1));
+Rerr_vs_mT[rho_min_scan][B].push_back(levy_scan->GetParError(1));
+mT_map[rho_min_scan][B].push_back(mT);
 
 chi2_map[rho_min_scan].push_back(chi2ndf_scan);
 //rho_map[rho_min_scan].push_back(rho_max_val);
 
             scan_functions.push_back(levy_scan);
-        }
+        
     }
 }
 // ----- Create two drawing functions -----
 // Global fit curves
-TF1* f_full = new TF1("f_full", LevySource3D, 0.5, 40.0, 3);
+TF1* f_full = new TF1("f_full", LevySource3D, 0.7, 40.0, 3);
 f_full->SetParameters(levy->GetParameters());
 f_full->SetLineColor(kRed);
 f_full->SetLineStyle(2);
 f_full->SetLineWidth(2);
 f_full->SetNpx(5000);
 
-TF1* f_fit = new TF1("f_fit", LevySource3D, 1.0, 30.0, 3);
+TF1* f_fit = new TF1("f_fit", LevySource3D, 1.0, 30 , 3);
 f_fit->SetParameters(levy->GetParameters());
 f_fit->SetLineColor(kRed);
 f_fit->SetLineStyle(1);
@@ -549,10 +727,10 @@ title->SetTextSize(0.045);
 
 gPad->GetListOfPrimitives()->Print();
 // ----- Information box -----
-TPaveText* infoBox = new TPaveText(0.60, 0.65, 0.99, 0.85, "NDC");
+/*TPaveText* infoBox = new TPaveText(0.60, 0.65, 0.99, 0.85, "NDC");
 infoBox->SetTextSize(0.035);
-infoBox->SetFillColor(0);
-infoBox->SetBorderSize(1);
+infoBox->SetFillStyle(0);   
+infoBox->SetBorderSize(0); 
 infoBox->SetTextFont(42);
 infoBox->SetTextAlign(12);
 infoBox->AddText(Form("%s , #sqrt{s_{NN}} = %.0f GeV", collision_system, sqrt_sNN));
@@ -560,17 +738,16 @@ infoBox->AddText(Form("Centrality : %s", centrality));
 infoBox->AddText(Form("  %.2f < p_{T} [GeV/c] < %.2f", pT_min, pT_max));
 infoBox->AddText(Form("  |#eta| < %.1f", eta_cut));
 infoBox->AddText(Form("  %.2f < k_{T}[GeV/c] < %.2f", kT_min, kT_max));
-infoBox->Draw();
+infoBox->Draw();*/
 
 // ----- Fit results box -----
-TPaveText* fitBox = new TPaveText(0.20, 0.50, 0.50, 0.75, "NDC");
-//TPaveText* fitBox = new TPaveText(0.15, 0.60, 0.45, 0.85, "NDC");
-fitBox->SetFillColor(0);
-fitBox->SetBorderSize(1);
+TPaveText* fitBox = new TPaveText(0.60, 0.65, 0.99, 0.85, "NDC");
+fitBox->SetFillStyle(0);   
+fitBox->SetBorderSize(0); 
 fitBox->SetTextFont(42);
 fitBox->SetTextSize(0.035);
 fitBox->SetTextAlign(12);
-fitBox->AddText("Levy Fit Results");
+fitBox->AddText(Form("  %.2f < k_{T}[GeV/c] < %.2f", kT_min, kT_max));
 fitBox->AddText(Form("#alpha = %.3f #pm %.3f", levy->GetParameter(0), levy->GetParError(0)));
 fitBox->AddText(Form("R = %.3f #pm %.3f fm", levy->GetParameter(1), levy->GetParError(1)));
 fitBox->AddText(Form("#lambda = %.3f #pm %.3f", levy->GetParameter(2), levy->GetParError(2)));
@@ -586,10 +763,11 @@ fout << setw(12) << Form("%.3f-%.3f", kT_min, kT_max)
      << setw(10) << Form("%.2f", chi2)
      << setw(10) << Form("%.0f", ndf)
      << setw(13) << Form("%.5f%%", CL*100)
+          << setw(15) << pion_pairs_count   // NEW COLUMN
      << "\n";
 
        // Save canvas as PNG and also to ROOT file
-        c1->SaveAs(Form("hbt_comparison_kT_%.2f-%.2f.png",kT_min,kT_max));
+        c1->SaveAs(Form("averAngular_Dist_kT_%.2f-%.2f.png",kT_min,kT_max));
         c1->Write();
 
     }
@@ -803,6 +981,11 @@ DrawRhoMinGraphs(R_map, R_map_err, rho_map,
 DrawRhoMinGraphs(lambda_map, lambda_map_err, rho_map,
                  "#lambda", "lambda_vs_rhomax",
                  rho_min_list, B_values);
+                 
+Draw_R_vs_mT_3Pads(R_vs_mT, Rerr_vs_mT, mT_map,
+                   rho_min_list, B_values);
+                   
+Draw_R_vs_mT_ByB(R_vs_mT, Rerr_vs_mT, mT_map, rho_min_list, B_values);
 
     cout << "\n========================================" << endl;
     cout << "Output files created:" << endl;
