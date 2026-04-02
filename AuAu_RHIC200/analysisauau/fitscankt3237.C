@@ -286,7 +286,7 @@ void auauok() {
     // =========================================
     // Configuration
     // =========================================
-    const char* oscar_file = "/home/zeinab/Documents/vhlle-smash/hybrid/sampler.out/test_run/particle_lists.oscar";
+    const char* oscar_file = "/home/zeinab/Documents/vhlle-smash/hybrid/AuAu_RHIC200/sampler.out/cent0_5/particle_lists_0.oscar";
     
     // =========================================
     // Load particles
@@ -372,7 +372,7 @@ for(int ibin = 0; ibin < nBins; ibin++)
     TCanvas* c1 = new TCanvas(Form("c1_%d", ibin), "HBT Comparison", 1400, 900);
     c1->SetLogx();
     c1->SetLogy();
-    c1->SetGrid();
+
 
     hRho_pions->SetMarkerStyle(20);
     hRho_pions->SetMarkerSize(0.7);
@@ -456,9 +456,10 @@ levy_scan->Draw("SAME");
         
         // ----- Fit results box -----
 
-        TPaveText* info = new TPaveText(0.55,0.55,0.95,0.9,"NDC");
-        info->SetFillColor(0);
-        info->SetBorderSize(1);
+        TPaveText* info = new TPaveText(0.6,0.6,0.95,0.95,"NDC");
+        info->SetFillStyle(0);   
+        info->SetBorderSize(0);
+        info->AddText(Form("  %.2f < k_{T}[GeV/c] < %.2f", kT_min, kT_max));
         info->AddText(Form("rho_min = %.2f", rho_min_scan));
         info->AddText(Form("B       = %.0f", B));
         info->AddText(Form("#alpha = %.3f #pm %.3f", levy_scan->GetParameter(0), levy_scan->GetParError(0)));
@@ -477,7 +478,7 @@ levy_scan->Draw("SAME");
 }
 
 // Save canvas
-c9->SaveAs(Form("Levy_scan_3x3_bin_%d.png", ibin));
+c9->SaveAs(Form("AvgAngularDist_Levyfit_kT3237.png", ibin));
 c9->Write();
 }
 fout.close();
