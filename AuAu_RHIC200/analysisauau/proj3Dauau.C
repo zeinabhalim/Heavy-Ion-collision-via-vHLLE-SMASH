@@ -27,14 +27,16 @@ struct Particle {
     Int_t event_id;
     Int_t pid;
     Float_t px, py, pz, E;
-    Float_t x, y, z, t;
+    Float_t x, y, z, t;  
 
     Float_t pT() const { return TMath::Sqrt(px*px + py*py); }
+
     Float_t p() const { return TMath::Sqrt(px*px + py*py + pz*pz); }
+
     Float_t eta() const {
         Float_t p_abs = p();
-        if (p_abs <= fabs(pz)) return (pz>0?999.0:-999.0);
-        return 0.5*TMath::Log((p_abs+pz)/(p_abs-pz));
+        if (p_abs <= fabs(pz)) return (pz > 0 ? 999.0 : -999.0);
+        return 0.5 * TMath::Log((p_abs + pz) / (p_abs - pz));
     }
 };
 
@@ -53,11 +55,13 @@ double LevyProj1DFunc(const double *x, const double *par)
 }
 
 // ===============================
-// OSCAR file loader
+// OSCAR2013 Loader (SMASH format)
+// t x y z mass E px py pz pid
 // ===============================
-vector<Particle> LoadOSCAR(const char* fname) {
+vector<Particle> LoadOSCAR(const char* fname)
+{
     vector<Particle> particles;
-    
+
     ifstream fin(fname);
     if (!fin.is_open()) {
         cout << "ERROR: Cannot open OSCAR file: " << fname << endl;
@@ -67,9 +71,11 @@ vector<Particle> LoadOSCAR(const char* fname) {
     string line;
     int event_id = -1;
 
-    while (getline(fin, line)) {
+    while (getline(fin, line))
+    {
         if (line.empty()) continue;
 
+        // --- event handling ---
         if (line[0] == '#') {
             if (line.find("# event") != string::npos) {
                 string tmp;
@@ -79,23 +85,51 @@ vector<Particle> LoadOSCAR(const char* fname) {
             continue;
         }
 
+        // --- Read particle line ---
         Particle p;
         float mass;
-        int charge, dummy;
-        
-       
 
         stringstream ss(line);
+
         ss >> p.t >> p.x >> p.y >> p.z >> mass
            >> p.E >> p.px >> p.py >> p.pz
-           >> p.pid >> dummy >> charge;
+           >> p.pid;
 
+        // Assign event ID
         p.event_id = event_id;
+
+        // --- Basic sanity check ---
+        if (ss.fail()) {
+            cout << "WARNING: Bad line skipped:\n" << line << endl;
+            continue;
+        }
+
         particles.push_back(p);
     }
 
     fin.close();
+
     cout << "Loaded " << particles.size() << " particles" << endl;
+
+    // --- sanity check ---
+    double tmin = 1e9, tmax = -1e9;
+    for (const auto& p : particles) {
+        if (p.t < tmin) tmin = p.t;
+        if (p.t > tmax) tmax = p.t;
+    }
+        cout << "Freeze-out time range: " << tmin << " → " << tmax << " fm/c" << endl;
+
+for (int i = 0; i < 5 && i < particles.size(); i++) {
+    const auto& p = particles[i];
+    cout << "PID=" << p.pid
+         << " t=" << p.t
+         << " x=" << p.x
+         << " px=" << p.px
+         << endl;
+}
+
+
+
     return particles;
 }
 
@@ -140,9 +174,9 @@ HBTResults AnalyzePairs(const vector<Particle>& particles,
    // =======================
 // Histogram binning
 // =======================
-const int n_bins = 150; 
-    double rho_min = 0.7;
-    double rho_max = 30.0;
+const int n_bins = 250; 
+    double rho_min = 0.1;
+    double rho_max = 1e15;
     double bins[n_bins + 1];
     
     double r = pow(rho_max / rho_min, 1.0 / n_bins);
@@ -252,7 +286,7 @@ hLong->Sumw2();
 }
 
 // ---------------------------
-// Main 3D Levy Analysis Function
+// Main Function
 // ---------------------------
 void auau3D()
 {
@@ -260,7 +294,8 @@ void auau3D()
     gStyle->SetOptTitle(0);
     TH1::AddDirectory(kFALSE);
 
-    const char* oscar_file = "/home/zeinab/Documents/vhlle-smash/hybrid/sampler.out/test_run/particle_lists.oscar";
+    const char* oscar_file = "/home/zeinab/Documents/vhlle-smash/hybrid/AuAu_RHIC200/sampler.out/cent0_5/particle_lists_0.oscar";
+    
 
     // --- Load particles ---
     vector<Particle> particles = LoadOSCAR(oscar_file);
@@ -268,8 +303,292 @@ void auau3D()
         cout << "No particles loaded!" << endl;
         return;
     }
+    
+    //check particls at freeze out
+   // 1. Declare histograms
+TH1F* hEta_eta    = new TH1F("hEta_eta",   "#eta (eta meson)", 100, -5, 5);
+TH1F* hEta_etap   = new TH1F("hEta_etap",  "#eta (eta')",      100, -5, 5);
+TH1F* hEta_lambda = new TH1F("hEta_lambda","#eta (Lambda)",    100, -5, 5);
+TH1F* hEta_k0s    = new TH1F("hEta_k0s",   "#eta (K0S)",       100, -5, 5);
 
-    // --- Initialize Levy reader ---
+// 2. Declare counters
+int n_eta=0, n_etap=0, n_lambda=0, n_k0s=0;
+
+// 3. Loop over particles and fill histograms
+for(const auto& p : particles){
+    if(p.pid==221) { n_eta++; hEta_eta->Fill(p.eta()); }
+    if(p.pid==331) { n_etap++; hEta_etap->Fill(p.eta()); }
+    if(p.pid==3122){ n_lambda++; hEta_lambda->Fill(p.eta()); }
+    if(p.pid==310) { n_k0s++; hEta_k0s->Fill(p.eta()); }
+}
+
+// 4. Print counts
+cout << "eta: " << n_eta << endl;
+cout << "eta': " << n_etap << endl;
+cout << "Lambda: " << n_lambda << endl;
+cout << "K0S: " << n_k0s << endl;
+
+// 5. Draw histograms in separate pads
+// 5. Draw histograms in separate pads with labels and particle counts
+TCanvas* cEta = new TCanvas("cEta","Particle #eta distributions",1000,800);
+cEta->Divide(2,2); // 2x2 grid
+
+// Function to create a TPaveText for particle counts
+auto drawCountBox = [](int count) {
+    TPaveText* box = new TPaveText(0.15,0.75,0.4,0.88,"NDC");
+    box->SetFillColorAlpha(kWhite,0.0); // transparent
+    box->SetBorderSize(0);
+    box->SetTextAlign(12); // left/top
+    box->AddText(Form("N = %d", count));
+    return box;
+};
+
+// Pad 1: eta
+cEta->cd(1);
+hEta_eta->SetLineColor(kRed);
+hEta_eta->GetXaxis()->SetTitle("#eta");
+hEta_eta->GetYaxis()->SetTitle("Counts");
+hEta_eta->Draw("HIST");
+TPaveText* box1 = drawCountBox(n_eta);
+box1->Draw();
+TLegend* leg1 = new TLegend(0.65,0.75,0.88,0.88);
+leg1->SetBorderSize(0);
+leg1->SetFillStyle(0);
+leg1->AddEntry(hEta_eta,"#eta","L");
+leg1->Draw();
+
+// Pad 2: eta'
+cEta->cd(2);
+hEta_etap->SetLineColor(kBlue);
+hEta_etap->GetXaxis()->SetTitle("#eta");
+hEta_etap->GetYaxis()->SetTitle("Counts");
+hEta_etap->Draw("HIST");
+TPaveText* box2 = drawCountBox(n_etap);
+box2->Draw();
+TLegend* leg2 = new TLegend(0.65,0.75,0.88,0.88);
+leg2->SetBorderSize(0);
+leg2->SetFillStyle(0);
+leg2->AddEntry(hEta_etap,"#eta'","L");
+leg2->Draw();
+
+// Pad 3: Lambda
+cEta->cd(3);
+hEta_lambda->SetLineColor(kGreen+2);
+hEta_lambda->GetXaxis()->SetTitle("#eta");
+hEta_lambda->GetYaxis()->SetTitle("Counts");
+hEta_lambda->Draw("HIST");
+TPaveText* box3 = drawCountBox(n_lambda);
+box3->Draw();
+TLegend* leg3 = new TLegend(0.65,0.75,0.88,0.88);
+leg3->SetBorderSize(0);
+leg3->SetFillStyle(0);
+leg3->AddEntry(hEta_lambda,"#Lambda","L");
+leg3->Draw();
+
+// Pad 4: K0S
+cEta->cd(4);
+hEta_k0s->SetLineColor(kMagenta);
+hEta_k0s->GetXaxis()->SetTitle("#eta");
+hEta_k0s->GetYaxis()->SetTitle("Counts");
+hEta_k0s->Draw("HIST");
+TPaveText* box4 = drawCountBox(n_k0s);
+box4->Draw();
+TLegend* leg4 = new TLegend(0.65,0.75,0.88,0.88);
+leg4->SetBorderSize(0);
+leg4->SetFillStyle(0);
+leg4->AddEntry(hEta_k0s,"K^{0}_{S}","L");
+leg4->Draw();
+
+// Update canvas
+cEta->Update();
+// ==========================================
+// Freeze-out time distributions (multi-species)
+// ==========================================
+
+// Pions
+TH1F* hT_piplus  = new TH1F("hT_piplus",  "t #pi^{+}", 200, 0, 150);
+TH1F* hT_piminus = new TH1F("hT_piminus", "t #pi^{-}", 200, 0, 150);
+TH1F* hT_all     = new TH1F("hT_all",     "t all #pi", 200, 0, 150);
+
+// Other species
+TH1F* hT_eta     = new TH1F("hT_eta",     "t #eta",    200, 0, 150);
+TH1F* hT_etap    = new TH1F("hT_etap",    "t #eta'",   200, 0, 150);
+TH1F* hT_lambda  = new TH1F("hT_lambda",  "t #Lambda", 200, 0, 150);
+
+// Fill histograms
+for(const auto& p : particles)
+{
+    // --- Pions ---
+    if(abs(p.pid) == 211){
+        hT_all->Fill(p.t);
+        if(p.pid == 211)  hT_piplus->Fill(p.t);
+        if(p.pid == -211) hT_piminus->Fill(p.t);
+    }
+
+    // --- Other particles ---
+    if(p.pid == 221)  hT_eta->Fill(p.t);
+    if(p.pid == 331)  hT_etap->Fill(p.t);
+    if(p.pid == 3122) hT_lambda->Fill(p.t);
+}
+
+// ==========================================
+// Canvas
+// ==========================================
+TCanvas* cTime = new TCanvas("cTime", "Freeze-out time comparison", 1400, 1000);
+cTime->Divide(2,2);
+
+// ---  pi+ vs pi-
+cTime->cd(1);
+//gPad->SetLogy();
+hT_piplus->GetYaxis()->SetTitle("Counts");
+hT_piplus->SetLineColor(kRed);
+hT_piminus->SetLineColor(kBlue);
+hT_piminus->GetXaxis()->SetTitle("t [fm/c]");
+hT_piplus->Draw("HIST");
+hT_piminus->Draw("HIST SAME");
+
+TLegend* legPi = new TLegend(0.6,0.7,0.88,0.88);
+legPi->SetBorderSize(0);
+legPi->SetFillStyle(0);
+legPi->AddEntry(hT_piplus,"#pi^{+}","L");
+legPi->AddEntry(hT_piminus,"#pi^{-}","L");
+legPi->Draw();
+
+// ---  eta
+cTime->cd(2);
+//gPad->SetLogy();
+hT_eta->SetLineColor(kMagenta);
+hT_eta->GetYaxis()->SetTitle("Counts");
+hT_eta->GetXaxis()->SetTitle("t [fm/c]");
+hT_eta->Draw("HIST");
+
+TLegend* legP = new TLegend(0.6,0.7,0.88,0.88);
+legP->SetBorderSize(0);
+legP->SetFillStyle(0);
+legP->AddEntry(hT_eta,"#eta","L");
+legP->Draw();
+
+// ---  eta meson
+cTime->cd(3);
+hT_etap->SetLineColor(kGreen+2);
+hT_etap->GetYaxis()->SetTitle("Counts");
+hT_etap->GetXaxis()->SetTitle("t [fm/c]");
+hT_etap->Draw("HIST");
+
+TLegend* legp = new TLegend(0.6,0.7,0.88,0.88);
+legp->SetBorderSize(0);
+legp->SetFillStyle(0);
+legp->AddEntry(hT_etap,"#eta'","L");
+legp->Draw();
+
+// ---  Lambda
+cTime->cd(4);
+hT_lambda->GetYaxis()->SetTitle("Counts");
+hT_lambda->SetLineColor(kOrange+7);
+hT_lambda->GetXaxis()->SetTitle("t [fm/c]");
+hT_lambda->Draw("HIST");
+
+TLegend* legl = new TLegend(0.6,0.7,0.88,0.88);
+legl->SetBorderSize(0);
+legl->SetFillStyle(0);
+legl->AddEntry(hT_lambda,"#Lambda","L");
+legl->Draw();
+
+cTime->SaveAs("Freezeout_time_all_species.png");
+
+// ==========================================
+// Momentum distributions for IDENTICAL pions
+// ==========================================
+
+// pi+
+TH1F* hPx_piplus = new TH1F("hPx_piplus","p_{x} #pi^{+}",200,-2,2);
+TH1F* hPy_piplus = new TH1F("hPy_piplus","p_{y} #pi^{+}",200,-2,2);
+TH1F* hPz_piplus = new TH1F("hPz_piplus","p_{z} #pi^{+}",200,-10,10);
+
+// pi-
+TH1F* hPx_piminus = new TH1F("hPx_piminus","p_{x} #pi^{-}",200,-2,2);
+TH1F* hPy_piminus = new TH1F("hPy_piminus","p_{y} #pi^{-}",200,-2,2);
+TH1F* hPz_piminus = new TH1F("hPz_piminus","p_{z} #pi^{-}",200,-10,10);
+
+for(const auto& p : particles)
+{
+    if(p.pid == 211){ // pi+
+        hPx_piplus->Fill(p.px);
+        hPy_piplus->Fill(p.py);
+        hPz_piplus->Fill(p.pz);
+    }
+
+    if(p.pid == -211){ // pi-
+        hPx_piminus->Fill(p.px);
+        hPy_piminus->Fill(p.py);
+        hPz_piminus->Fill(p.pz);
+    }
+}
+
+TCanvas* cMomPi = new TCanvas("cMomPi","Momentum components of pions",1200,400);
+cMomPi->Divide(3,1);
+//p_x
+cMomPi->cd(1);
+
+hPx_piplus->SetLineColor(kRed);
+hPx_piminus->SetLineColor(kBlue);
+
+hPx_piplus->GetXaxis()->SetTitle("p_{x} [GeV/c]");
+hPx_piplus->GetYaxis()->SetTitle("Counts");
+
+hPx_piplus->Draw("HIST");
+hPx_piminus->Draw("HIST SAME");
+
+TLegend* legPx = new TLegend(0.65,0.75,0.88,0.88);
+legPx->SetBorderSize(0);
+legPx->SetFillStyle(0);
+legPx->AddEntry(hPx_piplus,"#pi^{+}","L");
+legPx->AddEntry(hPx_piminus,"#pi^{-}","L");
+legPx->Draw();
+
+//p_y
+cMomPi->cd(2);
+
+hPy_piplus->SetLineColor(kRed);
+hPy_piminus->SetLineColor(kBlue);
+
+hPy_piplus->GetXaxis()->SetTitle("p_{y} [GeV/c]");
+
+hPy_piplus->Draw("HIST");
+hPy_piminus->Draw("HIST SAME");
+
+TLegend* legPy = new TLegend(0.65,0.75,0.88,0.88);
+legPy->SetBorderSize(0);
+legPy->SetFillStyle(0);
+legPy->AddEntry(hPy_piplus,"#pi^{+}","L");
+legPy->AddEntry(hPy_piminus,"#pi^{-}","L");
+legPy->Draw();
+
+//p_z
+cMomPi->cd(3);
+
+hPz_piplus->SetLineColor(kRed);
+hPz_piminus->SetLineColor(kBlue);
+
+hPz_piplus->GetXaxis()->SetTitle("p_{z} [GeV/c]");
+
+hPz_piplus->Draw("HIST");
+hPz_piminus->Draw("HIST SAME");
+
+TLegend* legPz = new TLegend(0.65,0.75,0.88,0.88);
+legPz->SetBorderSize(0);
+legPz->SetFillStyle(0);
+legPz->AddEntry(hPz_piplus,"#pi^{+}","L");
+legPz->AddEntry(hPz_piminus,"#pi^{-}","L");
+legPz->Draw();
+
+cMomPi->SaveAs("Momentum_components_pions.png");
+
+
+//========================================================================
+//ANALYSIS PAIRS section
+//=======================================================================
+// --- Initialize Levy reader ---
     myLevy_reader = new Levy_reader("levy_proj3D_values.dat");
 
     // --- kT bins ---
@@ -285,6 +604,14 @@ for(double k = kT_min_val; k <= kT_max_val + 1e-6; k += step)
 }
 
 int nBins = kT_bins.size()-1;
+
+vector<double> mt_vals, mt_err;
+vector<double> alpha_vals, alpha_err;
+vector<double> Rout_vals, Rout_err;
+vector<double> Rside_vals, Rside_err;
+vector<double> Rlong_vals, Rlong_err;
+vector<double> lambda_vals, lambda_err;  
+
 
     // --- Loop over kT bins ---
     for(int ibin = 0; ibin < nBins; ibin++)
@@ -367,6 +694,31 @@ minimizer->SetLimitedVariable(4, "N",1.0, 0.05, 0.0, 2.0);
        double chi2 =  minimizer->MinValue(); 
        int ndf = actualBins - NPAR; 
        double CL = (ndf > 0) ? TMath::Prob(chi2, ndf) : 0;
+       
+       // --- Compute mean kT and mT ---
+double kT_mean = 0.5 * (kT_min + kT_max);
+const double m_pi = 0.13957; 
+double mT = sqrt(kT_mean * kT_mean + m_pi * m_pi);
+
+// Store
+mt_vals.push_back(mT);
+mt_err.push_back(0.0);   // no error on mT (you can set to bin half‑width if needed)
+
+alpha_vals.push_back(p[0]);
+alpha_err.push_back(err[0]);
+
+Rout_vals.push_back(p[1]);
+Rout_err.push_back(err[1]);
+
+Rside_vals.push_back(p[2]);
+Rside_err.push_back(err[2]);
+
+Rlong_vals.push_back(p[3]);
+Rlong_err.push_back(err[3]);
+
+lambda_vals.push_back(p[4]);
+lambda_err.push_back(err[4]);
+
 
         // --- Print fit results ---
         bool success = minimizer->Status() == 0;
@@ -407,9 +759,9 @@ minimizer->SetLimitedVariable(4, "N",1.0, 0.05, 0.0, 2.0);
           
            // Set the Range and Axis limits
            double xmin[3] = {0.8 , 0.8, 0.8};
-           double xmax[3] = {30 , 30, 30};
+           double xmax[3] = {1e10 , 1e10, 1e10};
             h->GetXaxis()->SetRangeUser(xmin[idir], xmax[idir]);
-            h->SetMinimum(1e-4);  
+            h->SetMinimum(1e-10);  
             h->SetMaximum(1.0);  
             h->SetMarkerStyle(20);
             h->SetMarkerSize(0.8);
@@ -434,28 +786,137 @@ minimizer->SetLimitedVariable(4, "N",1.0, 0.05, 0.0, 2.0);
             flevy->Draw("SAME");
 
             // fit Parameter box
-            TPaveText* box = new TPaveText(0.15,0.55,0.50,0.88,"NDC");
-            box->SetFillColor(0);
-            box->SetTextSize(0.035);
-            box->AddText(Form("#alpha = %.3f #pm %.3f", p[0], err[0]));
-            box->AddText(Form("R_{%s} = %.2f #pm %.2f fm", names[idir], p[idir+1], err[idir+1]));
-            box->AddText(Form("#lambda = %.2f #pm %.2f", p[4], err[4]));
-            box->AddText(Form("#chi^{2}/NDF = %.2f / %.d", chi2, ndf));
-            box->AddText(Form("C.L. = %.4f%%", CL *100));
-                       
-            box->Draw();
+            TPaveText* box = new TPaveText(0.35, 0.15, 0.65, 0.40, "NDC");
+
+box->SetFillStyle(0);     // transparent
+box->SetBorderSize(0);    // no border
+box->SetTextSize(0.035);
+box->SetTextAlign(22);    // center text
+
+box->AddText(Form("#alpha = %.3f #pm %.3f", p[0], err[0]));
+box->AddText(Form("R_{%s} = %.2f #pm %.2f fm", names[idir], p[idir+1], err[idir+1]));
+box->AddText(Form("#lambda = %.2f #pm %.2f", p[4], err[4]));
+box->AddText(Form("#chi^{2}/NDF = %.2f / %d", chi2, ndf));
+box->AddText(Form("C.L. = %.2f%%", CL*100));
+
+box->Draw();
         }
 
         c->cd(1);
-        TPaveText* info = new TPaveText(0.15,0.85,0.45,0.95,"NDC");
-        info->AddText(Form("kT: %.2f-%.2f GeV/c", kT_min, kT_max));
-        info->AddText(Form("N_{pairs} = %d", res.total_pairs));
-  
-        info->Draw();
+        TPaveText* info = new TPaveText(0.65, 0.80, 0.95, 0.95, "NDC");
 
+info->SetFillStyle(0);     // transparent
+info->SetBorderSize(0);    // no border
+info->SetTextSize(0.04);
+info->SetTextAlign(32);    // right-aligned text
+
+info->AddText(Form("kT: %.2f-%.2f GeV/c", kT_min, kT_max));
+info->AddText(Form("N_{pairs} = %d", res.total_pairs));
+
+info->Draw();
         c->SaveAs(Form("kT_%.2f-%.2f.png", kT_min, kT_max));
 
         delete minimizer;
     }
+    // --- New canvas: mT dependence of all fit parameters ---
+TCanvas *c_mT = new TCanvas("c_mT", "Fit Parameters vs m_T", 1600, 1200);
+c_mT->Divide(2, 2);
+
+int nPoints = mt_vals.size();
+
+// ========== Pad 1 : alpha ==========
+c_mT->cd(1);
+TGraphErrors *gAlpha = new TGraphErrors(nPoints,
+    &mt_vals[0], &alpha_vals[0],
+    &mt_err[0],  &alpha_err[0]);
+gAlpha->SetTitle("#alpha vs m_{T}; m_{T} [GeV]; #alpha");
+gAlpha->SetMarkerStyle(20);
+gAlpha->SetMarkerColor(kBlack);
+gAlpha->Draw("AP");
+
+// ========== Pad 2 : Rout, Rside, Rlong together ==========
+c_mT->cd(2);
+
+TGraphErrors *gRout = new TGraphErrors(nPoints,
+    &mt_vals[0], &Rout_vals[0],
+    &mt_err[0],  &Rout_err[0]);
+gRout->SetMarkerStyle(21);
+gRout->SetMarkerColor(kRed);
+gRout->SetLineColor(kRed);
+gRout->SetTitle("HBT radii vs m_{T}; m_{T} [GeV]; R [fm]");
+
+TGraphErrors *gRside = new TGraphErrors(nPoints,
+    &mt_vals[0], &Rside_vals[0],
+    &mt_err[0],  &Rside_err[0]);
+gRside->SetMarkerStyle(22);
+gRside->SetMarkerColor(kBlue);
+gRside->SetLineColor(kBlue);
+
+
+TGraphErrors *gRlong = new TGraphErrors(nPoints,
+    &mt_vals[0], &Rlong_vals[0],
+    &mt_err[0],  &Rlong_err[0]);
+gRlong->SetMarkerStyle(23);
+gRlong->SetMarkerColor(kGreen+2);
+gRlong->SetLineColor(kGreen+2);
+
+
+// VERY IMPORTANT
+gPad->Update();
+
+// Set ONLY Y range (X stays automatic)
+gRout->GetHistogram()->GetYaxis()->SetRangeUser(2.0, 6.0);
+// Draw first graph to set axes, then overlay the others
+gRout->Draw("AP");
+gRside->Draw("P SAME");
+gRlong->Draw("P SAME");
+
+// Legend
+TLegend *legRadii = new TLegend(0.65, 0.70, 0.88, 0.88);
+legRadii->SetBorderSize(0);
+legRadii->SetFillStyle(0);
+legRadii->AddEntry(gRout, "R_{out}", "P");
+legRadii->AddEntry(gRside, "R_{side}", "P");
+legRadii->AddEntry(gRlong, "R_{long}", "P");
+legRadii->Draw();
+
+// ========== Pad 3 : lambda (N) ==========
+c_mT->cd(3);
+TGraphErrors *gLambda = new TGraphErrors(nPoints,
+    &mt_vals[0], &lambda_vals[0],
+    &mt_err[0],  &lambda_err[0]);
+gLambda->SetTitle("#lambda vs m_{T}; m_{T} [GeV]; #lambda");
+gLambda->SetMarkerStyle(20);
+gLambda->SetMarkerColor(kBlack);
+gLambda->Draw("AP");
+
+// ========== Pad 4 : system information ==========
+c_mT->cd(4);
+gPad->SetFillColor(0);
+gPad->SetFrameBorderMode(0);
+
+TPaveText *sysInfo = new TPaveText(0.10, 0.10, 0.90, 0.90, "NDC");
+sysInfo->SetTextSize(0.045);
+sysInfo->SetFillColor(0);
+sysInfo->SetBorderSize(1);
+sysInfo->SetTextFont(42);
+sysInfo->SetTextAlign(12);
+
+sysInfo->AddText("System Information");
+sysInfo->AddText("---------------------------");
+sysInfo->AddText(Form("%s", collision_system));
+sysInfo->AddText(Form("#sqrt{s_{NN}} = %.0f GeV", sqrt_sNN));
+sysInfo->AddText(Form("Centrality: %s", centrality));
+sysInfo->AddText(" ");
+sysInfo->AddText("Kinematic cuts:");
+sysInfo->AddText(Form("%.2f < p_{T} < %.2f GeV/c", pT_min, pT_max));
+sysInfo->AddText(Form("|#eta| < %.1f", eta_cut));
+sysInfo->AddText(Form("k_{T} range: %.2f - %.2f GeV/c",
+                kT_min_val, kT_max_val));
+sysInfo->Draw();
+
+// Optional: save the canvas
+c_mT->SaveAs("Proj3D_FitParameters_vs_mT.png");
+c_mT->Write();   // if you have a ROOT file open
     
 }
