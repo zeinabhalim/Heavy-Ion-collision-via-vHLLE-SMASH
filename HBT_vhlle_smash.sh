@@ -22,11 +22,9 @@ echo "time ../vhlle/hlle_visc -params AuAu_RHIC200/hydro.in/$prefix -ISinput ic/
 echo "time ../smash-hadron-sampler/build/sampler events 1 AuAu_RHIC200/sampler.in/$prefix -surface AuAu_RHIC200/hydro.out/$prefix/freezeout.dat -output AuAu_RHIC200/sampler.out/$prefix/ >> AuAu_RHIC200/hydrologs/$prefix/o.log 2>> AuAu_RHIC200/hydrologs/$prefix/e.log" >> $job_file
 echo "mv AuAu_RHIC200/sampler.out/$prefix/particle_lists.oscar AuAu_RHIC200/sampler.out/$prefix/particle_lists_0" >> $job_file
 echo "time ../smash/build/smash -i AuAu_RHIC200/smash.in/$prefix.yaml -o AuAu_RHIC200/smash.out/$prefix/ -f >> AuAu_RHIC200/hydrologs/$prefix/o.log 2>> AuAu_RHIC200/hydrologs/$prefix/e.log" >> $job_file
-# if you don't need the freezeout hypersurface, you can delete the output from hydro,
-# because it leaves quite large files (especially when running event-by-event)
-#echo "rm -r AuAu_RHIC200/hydro.out/$prefix" >> $job_file
 
-# create input file for hydro - need to create in the system-specific directory
+
+# create input file for hydro 
 hydro_in=AuAu_RHIC200/hydro.in/$prefix
 mkdir -p AuAu_RHIC200/hydro.in
 echo "! EoS type: 0 = complex EoS, 1 = simple table (eosFile)" > $hydro_in
