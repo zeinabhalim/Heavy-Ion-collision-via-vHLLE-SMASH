@@ -14,31 +14,12 @@
 #include <map>
 #include <sstream>
 #include <iomanip>
+#include <TRandom3.h>
 #include "Levy_proj_reader.h"
 
 using namespace std;
 
 Levy_reader* myLevy_reader;
-
-// ===============================
-// Particle structure
-// ===============================
-struct Particle {
-    Int_t event_id;
-    Int_t pid;
-    Float_t px, py, pz, E;
-    Float_t x, y, z, t;  
-
-    Float_t pT() const { return TMath::Sqrt(px*px + py*py); }
-
-    Float_t p() const { return TMath::Sqrt(px*px + py*py + pz*pz); }
-
-    Float_t eta() const {
-        Float_t p_abs = p();
-        if (p_abs <= fabs(pz)) return (pz > 0 ? 999.0 : -999.0);
-        return 0.5 * TMath::Log((p_abs + pz) / (p_abs - pz));
-    }
-};
 
 // ===============================
 // Levy projection
@@ -55,28 +36,41 @@ double LevyProj1DFunc(const double *x, const double *par)
 }
 
 // ===============================
-// OSCAR2013 Loader (SMASH format)
-// t x y z mass E px py pz pid
+// Particle structure
 // ===============================
+struct Particle {
+    Int_t event_id;
+    Int_t pid;
+    Int_t charge;
+    Int_t ID;
+
+    Double_t px, py, pz, E;
+    Double_t x, y, z, t;
+
+    Float_t pT() const { return TMath::Sqrt(px*px + py*py); }
+
+    Float_t p() const { return TMath::Sqrt(px*px + py*py + pz*pz); }
+
+    Float_t eta() const {
+        Float_t p_abs = p();
+        if (p_abs <= fabs(pz)) return (pz > 0 ? 999.0 : -999.0);
+        return 0.5 * TMath::Log((p_abs + pz) / (p_abs - pz));
+    }
+};
+
+//Filling from oscar file 
+
 vector<Particle> LoadOSCAR(const char* fname)
 {
     vector<Particle> particles;
 
     ifstream fin(fname);
-    if (!fin.is_open()) {
-        cout << "ERROR: Cannot open OSCAR file: " << fname << endl;
-        return particles;
-    }
-
     string line;
     int event_id = -1;
 
     while (getline(fin, line))
     {
-        if (line.empty()) continue;
-
-        // --- event handling ---
-        if (line[0] == '#') {
+        if (line.empty() || line[0]=='#') {
             if (line.find("# event") != string::npos) {
                 string tmp;
                 stringstream ss(line);
@@ -85,50 +79,56 @@ vector<Particle> LoadOSCAR(const char* fname)
             continue;
         }
 
-        // --- Read particle line ---
-        Particle p;
-        float mass;
-
         stringstream ss(line);
 
-        ss >> p.t >> p.x >> p.y >> p.z >> mass
-           >> p.E >> p.px >> p.py >> p.pz
-           >> p.pid;
+        Particle p;
 
-        // Assign event ID
+        double mass, E;
+        int pdg, ID, charge, ncoll;
+        double form_time;
+        double time_last_coll;
+        double xsecfac;
+        double proc_id_origin;
+        double proc_type_origin;
+        double pdg_mother1;
+        double pdg_mother2;
+        double baryon_number;
+   
+
+ss >> p.t
+   >> p.x >> p.y >> p.z
+   >> mass >> E
+   >> p.px >> p.py >> p.pz
+   >> pdg >> ID >> charge >> ncoll
+   >> form_time
+   >> xsecfac >> proc_id_origin >> proc_type_origin
+   >> time_last_coll
+   >> pdg_mother1 >> pdg_mother2 >> baryon_number;
+
+        if (ss.fail()) continue;
+
+
+        // on-shell SMASH energy correction
+        double p2 = p.px*p.px + p.py*p.py + p.pz*p.pz;
+        p.E = sqrt(p2 + mass*mass);
+        
+        // emission time correction
+        TRandom3 *randGen = new TRandom3(0); 
+       double tau_0 = (time_last_coll > 0) ? time_last_coll : time_last_coll - form_time ; // approx. last spread time 
+       //double gamma = p.E / mass; 
+       double delta_t = randGen->Exp(fabs(tau_0)); // Exponential decay mimics decoupling
+
+       p.t = form_time + delta_t;
+
+        p.pid = pdg;
+        p.ID = ID;
+        p.charge = charge;
         p.event_id = event_id;
-
-        // --- Basic sanity check ---
-        if (ss.fail()) {
-            cout << "WARNING: Bad line skipped:\n" << line << endl;
-            continue;
-        }
 
         particles.push_back(p);
     }
 
-    fin.close();
-
-    cout << "Loaded " << particles.size() << " particles" << endl;
-
-    // --- sanity check ---
-    double tmin = 1e9, tmax = -1e9;
-    for (const auto& p : particles) {
-        if (p.t < tmin) tmin = p.t;
-        if (p.t > tmax) tmax = p.t;
-    }
-        cout << "Freeze-out time range: " << tmin << " → " << tmax << " fm/c" << endl;
-
-for (int i = 0; i < 5 && i < particles.size(); i++) {
-    const auto& p = particles[i];
-    cout << "PID=" << p.pid
-         << " t=" << p.t
-         << " x=" << p.x
-         << " px=" << p.px
-         << endl;
-}
-
-
+    cout << "Loaded " << particles.size() << " particles\n";
 
     return particles;
 }
@@ -174,9 +174,9 @@ HBTResults AnalyzePairs(const vector<Particle>& particles,
    // =======================
 // Histogram binning
 // =======================
-const int n_bins = 250; 
+const int n_bins = 300; 
     double rho_min = 0.1;
-    double rho_max = 1e15;
+    double rho_max = 1e12;
     double bins[n_bins + 1];
     
     double r = pow(rho_max / rho_min, 1.0 / n_bins);
@@ -191,6 +191,7 @@ hRho->Sumw2();
 TH1F* hOut  = new TH1F("hOut",  "", n_bins, bins);
 TH1F* hSide = new TH1F("hSide", "", n_bins, bins);
 TH1F* hLong = new TH1F("hLong", "", n_bins, bins);
+
 
 hOut->Sumw2();
 hSide->Sumw2();
@@ -231,7 +232,7 @@ hLong->Sumw2();
                 double mT = sqrt(kT*kT + mpi*mpi);
 
                  // mT dependent cut
-                 double c = 0.15 ; 
+                 double c = 0.15; 
                  double qmCut = sqrt(c * mT);
            
                   // relative momentum  in the LCMS
@@ -239,7 +240,7 @@ hLong->Sumw2();
                  double qy = p1.py - p2.py;
                  double qzL = (4*pow((p1.pz * p2.E - p2.pz * p1.E),2))/(pow((p1.E+p2.E),2)-pow((p1.pz+p2.pz),2));
 
-                 double qLCMS = TMath::Sqrt(qx*qx + qy*qy + qzL);
+                 double_t qLCMS = TMath::Sqrt(qx*qx + qy*qy + qzL);
 
                // Pair cuts due to kT
                 if (kT < kT_min || kT > kT_max) continue;
@@ -256,8 +257,35 @@ hLong->Sumw2();
                 double dz = p1.z - p2.z;
                 double dt = p1.t - p2.t;
                 
+                /*/ 1. Pair kinematics in Lab Frame
+double K0 = 0.5 * (p1.E + p2.E);
+double beta = kz / K0;
+double gamma = 1.0 / sqrt(1.0 - beta * beta);
+
+// 3. Transform dz and dt to the LCMS frame
+// This is the "Longitudinal" boost
+double dz_L = gamma * (dz - beta * dt);
+double dt_L = gamma * (dt - beta * dz);
+
+// 4. Calculate Bertsch-Pratt coordinates
+double phi = atan2(ky, kx);
+double beta_T = kT / sqrt(K0*K0 - kz*kz); // Transverse velocity in LCMS
+
+// r_side: purely geometric
+double r_side = -TMath::Sin(phi) * dx + TMath::Cos(phi) * dy;
+
+// r_out: includes the emission duration correction
+double r_out_spatial = TMath::Cos(phi) * dx + TMath::Sin(phi) * dy;
+double r_out = r_out_spatial - beta_T * dt_L;
+
+// r_long: is simply the boosted dz
+                double r_long = (K0*dz - kz*dt) / sqrt(K0*K0 - kz*kz);
+//double r_long = dz_L;
+
+double rho = sqrt(r_out * r_out + r_side * r_side + r_long * r_long);*/
+
                 // LCMS transformation
-                double K0 = 0.5 * (p1.E + p2.E); //pair energy
+                double_t K0 = 0.5 * (p1.E + p2.E); //pair energy
                 double kp = K0*K0 - kz*kz;
                  double phi = atan2(ky, kx); // azimuthal angle
                 
@@ -294,7 +322,7 @@ void auau3D()
     gStyle->SetOptTitle(0);
     TH1::AddDirectory(kFALSE);
 
-    const char* oscar_file = "/home/zeinab/Documents/vhlle-smash/hybrid/AuAu_RHIC200/sampler.out/cent0_5/particle_lists_0.oscar";
+    const char* oscar_file = "/home/zeinab/Documents/vhlle-smash/hybrid/AuAu_RHIC200/smash.out/cent0_5/particle_lists.oscar";
     
 
     // --- Load particles ---
@@ -310,6 +338,7 @@ TH1F* hEta_eta    = new TH1F("hEta_eta",   "#eta (eta meson)", 100, -5, 5);
 TH1F* hEta_etap   = new TH1F("hEta_etap",  "#eta (eta')",      100, -5, 5);
 TH1F* hEta_lambda = new TH1F("hEta_lambda","#eta (Lambda)",    100, -5, 5);
 TH1F* hEta_k0s    = new TH1F("hEta_k0s",   "#eta (K0S)",       100, -5, 5);
+
 
 // 2. Declare counters
 int n_eta=0, n_etap=0, n_lambda=0, n_k0s=0;
@@ -625,8 +654,8 @@ vector<double> lambda_vals, lambda_err;
         HBTResults res = AnalyzePairs(particles, kT_min, kT_max, true);
 
         // --- Fit range ---
-        const double fit_min = 1.0;
-        double fit_max_x[3] = {20.0, 10.0, 20.0}; // out, side, long
+        const double fit_min = 0.1;
+        double fit_max_x[3] = {100.0, 100.0, 100.0}; // out, side, long
         const int NPAR = 5;
 
 struct LogLikelihood {
@@ -681,11 +710,11 @@ ROOT::Math::Functor f(loglikfunc, NPAR);
         minimizer->SetTolerance(1e-6);
 
         // --- fitting parameters ---
-minimizer->SetLimitedVariable(0, "alpha", 1.4, 0.05, 0.8, 2.0); 
-minimizer->SetLimitedVariable(1, "Rout",  4.0, 0.1, 1.0, 20.0);
-minimizer->SetLimitedVariable(2, "Rside", 2.0, 0.1, 1.0, 20.0);
-minimizer->SetLimitedVariable(3, "Rlong", 5.0, 0.1, 1.0, 20.0);
-minimizer->SetLimitedVariable(4, "N",1.0, 0.05, 0.0, 2.0);
+minimizer->SetLimitedVariable(0, "alpha", 1.5, 0.01, 0.5, 2.0);
+minimizer->SetLimitedVariable(1, "Rout",  4.0, 0.1, 1.0, 30.0);
+minimizer->SetLimitedVariable(2, "Rside", 2.0, 0.1, 1.0, 30.0);
+minimizer->SetLimitedVariable(3, "Rlong", 4.0, 0.1, 1.0, 30.0);
+minimizer->SetLimitedVariable(4, "N",1.0, 0.01, 0.0, 2.0);
 
         minimizer->Minimize();
 
@@ -755,11 +784,11 @@ lambda_err.push_back(err[4]);
                TH1F* h = hdir[idir];
                
           // scalling 
-          h->Scale(1.0 / h->Integral(), "width");
+         h->Scale(1.0 / h->Integral(), "width");
           
            // Set the Range and Axis limits
-           double xmin[3] = {0.8 , 0.8, 0.8};
-           double xmax[3] = {1e10 , 1e10, 1e10};
+           double xmin[3] = {0.1 , 0.1, 0.1};
+           double xmax[3] = {1e12 , 1e12, 1e12};
             h->GetXaxis()->SetRangeUser(xmin[idir], xmax[idir]);
             h->SetMinimum(1e-10);  
             h->SetMaximum(1.0);  
@@ -832,7 +861,9 @@ TGraphErrors *gAlpha = new TGraphErrors(nPoints,
 gAlpha->SetTitle("#alpha vs m_{T}; m_{T} [GeV]; #alpha");
 gAlpha->SetMarkerStyle(20);
 gAlpha->SetMarkerColor(kBlack);
+gAlpha->GetHistogram()->GetYaxis()->SetRangeUser(1.5, 2.5);
 gAlpha->Draw("AP");
+
 
 // ========== Pad 2 : Rout, Rside, Rlong together ==========
 c_mT->cd(2);
@@ -861,11 +892,11 @@ gRlong->SetMarkerColor(kGreen+2);
 gRlong->SetLineColor(kGreen+2);
 
 
-// VERY IMPORTANT
+
 gPad->Update();
 
-// Set ONLY Y range (X stays automatic)
-gRout->GetHistogram()->GetYaxis()->SetRangeUser(2.0, 6.0);
+// Set range
+gRout->GetHistogram()->GetYaxis()->SetRangeUser(4.0, 35.0);
 // Draw first graph to set axes, then overlay the others
 gRout->Draw("AP");
 gRside->Draw("P SAME");
