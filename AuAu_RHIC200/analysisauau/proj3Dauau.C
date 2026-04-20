@@ -20,6 +20,37 @@
 using namespace std;
 
 Levy_reader* myLevy_reader;
+using namespace std;
+double getLifetimeFromPDG(int pdg)
+{
+    switch(abs(pdg))
+    {
+        case 113: return 1.3;      // rho
+        case 213: return 1.3;
+        case 333: return 46.0;     // phi
+        case 221: return 1000.0;   // eta
+        case 331: return 1000.0;   // eta'
+        case 310: return 2.68e4;   // K0S
+        case 3122: return 7.9;     // Lambda
+        case 3222: return 5.0;     // Sigma+
+        case 3212: return 5.0;     // Sigma0
+        case 3112: return 5.0;     // Sigma-
+        default:  return 1.0;      // generic short-lived
+    }
+}
+bool isLongLived(int pdg)
+{
+    pdg = abs(pdg);
+
+    if (pdg == 111) return true;  // pi0
+    if (pdg == 221) return true;  // eta
+    if (pdg == 331) return true;  // eta'
+    if (pdg == 311) return true;  // K0
+    if (pdg == 130) return true;  // K_L
+    if (pdg == 310) return true;  // K_S
+
+    return false;
+}
 
 // ===============================
 // Levy projection
@@ -39,17 +70,29 @@ double LevyProj1DFunc(const double *x, const double *par)
 // Particle structure
 // ===============================
 struct Particle {
-    Int_t event_id;
-    Int_t pid;
-    Int_t charge;
-    Int_t ID;
-
+    Int_t   event_id;
+    Int_t   pid;
+    Int_t   charge;
+    Int_t   ID;
+    
     Double_t px, py, pz, E;
-    Double_t x, y, z, t;
+    Double_t x,  y,  z,  t;          // position at output file
+    Double_t xf, yf, zf, tf;         // freeze‑out coordinates (to be filled)
+    Double_t time_last_coll;         // read from OSCAR (column 15 in the file)
+    Int_t   proc_type;
 
+    Double_t mass() const { return sqrt(E*E - (px*px + py*py + pz*pz)); }
+    Double_t pt()   const { return sqrt(px*px + py*py); }
+    Double_t p()    const { return sqrt(px*px + py*py + pz*pz); }
+    Double_t betaX() const { return px / E; }
+    Double_t betaY() const { return py / E; }
+    Double_t betaZ() const { return pz / E; }
+    
+    Int_t mom1;        // mother PDG 1
+    Int_t mom2;        // mother PDG 2
+    
     Float_t pT() const { return TMath::Sqrt(px*px + py*py); }
-
-    Float_t p() const { return TMath::Sqrt(px*px + py*py + pz*pz); }
+    
 
     Float_t eta() const {
         Float_t p_abs = p();
@@ -112,18 +155,24 @@ ss >> p.t
         double p2 = p.px*p.px + p.py*p.py + p.pz*p.pz;
         p.E = sqrt(p2 + mass*mass);
         
-        // emission time correction
-        TRandom3 *randGen = new TRandom3(0); 
-       double tau_0 = (time_last_coll > 0) ? time_last_coll : time_last_coll - form_time ; // approx. last spread time 
-       //double gamma = p.E / mass; 
-       double delta_t = randGen->Exp(fabs(tau_0)); // Exponential decay mimics decoupling
+// ---------- back‑propagation to reconstruct freezout Space-time coordinates-----------------------------------------
+p.time_last_coll = time_last_coll;               
 
-       p.t = form_time + delta_t;
+if (p.time_last_coll < p.t) {                     
+    double dt = p.t - p.time_last_coll;          // Δt = t_out - t_f  (>0)
+    p.xf = p.x - p.betaX()*dt;
+    p.yf = p.y - p.betaY()*dt;
+    p.zf = p.z - p.betaZ()*dt;
+    p.tf = p.time_last_coll;
+} else {
+    continue;    
+}
 
         p.pid = pdg;
         p.ID = ID;
         p.charge = charge;
         p.event_id = event_id;
+                p.proc_type = (Int_t)proc_type_origin;
 
         particles.push_back(p);
     }
@@ -168,6 +217,7 @@ HBTResults AnalyzePairs(const vector<Particle>& particles,
     map<int, vector<Particle>> events;
     for(auto& p : particles){
         if(pions_only && abs(p.pid)!=211) continue;
+  // if (p.proc_type != 1) continue; 
         events[p.event_id].push_back(p);
     }
 
@@ -232,7 +282,7 @@ hLong->Sumw2();
                 double mT = sqrt(kT*kT + mpi*mpi);
 
                  // mT dependent cut
-                 double c = 0.15; 
+                 double c = 0.2; 
                  double qmCut = sqrt(c * mT);
            
                   // relative momentum  in the LCMS
@@ -252,37 +302,16 @@ hLong->Sumw2();
                 pairs_count++;
                 
                 // Spatial separation
-                double dx = p1.x - p2.x;
+                double dx = p1.xf - p2.xf;
+                double dy = p1.yf - p2.yf;
+                double dz = p1.zf - p2.zf;
+                double dt = p1.tf - p2.tf;
+                
+                /*double dx = p1.x - p2.x;
                 double dy = p1.y - p2.y;
                 double dz = p1.z - p2.z;
-                double dt = p1.t - p2.t;
+                double dt = p1.t - p2.t;*/
                 
-                /*/ 1. Pair kinematics in Lab Frame
-double K0 = 0.5 * (p1.E + p2.E);
-double beta = kz / K0;
-double gamma = 1.0 / sqrt(1.0 - beta * beta);
-
-// 3. Transform dz and dt to the LCMS frame
-// This is the "Longitudinal" boost
-double dz_L = gamma * (dz - beta * dt);
-double dt_L = gamma * (dt - beta * dz);
-
-// 4. Calculate Bertsch-Pratt coordinates
-double phi = atan2(ky, kx);
-double beta_T = kT / sqrt(K0*K0 - kz*kz); // Transverse velocity in LCMS
-
-// r_side: purely geometric
-double r_side = -TMath::Sin(phi) * dx + TMath::Cos(phi) * dy;
-
-// r_out: includes the emission duration correction
-double r_out_spatial = TMath::Cos(phi) * dx + TMath::Sin(phi) * dy;
-double r_out = r_out_spatial - beta_T * dt_L;
-
-// r_long: is simply the boosted dz
-                double r_long = (K0*dz - kz*dt) / sqrt(K0*K0 - kz*kz);
-//double r_long = dz_L;
-
-double rho = sqrt(r_out * r_out + r_side * r_side + r_long * r_long);*/
 
                 // LCMS transformation
                 double_t K0 = 0.5 * (p1.E + p2.E); //pair energy
@@ -314,7 +343,7 @@ double rho = sqrt(r_out * r_out + r_side * r_side + r_long * r_long);*/
 }
 
 // ---------------------------
-// Main Function
+// Main Functio
 // ---------------------------
 void auau3D()
 {
@@ -331,6 +360,16 @@ void auau3D()
         cout << "No particles loaded!" << endl;
         return;
     }
+    int nCore = 0, nHalo = 0;
+for (auto &p : particles) {
+    bool longLived = isLongLived(p.pid);
+        if (abs(p.pid) != 211) continue;
+    if (longLived) ++nHalo; else ++nCore;
+}
+cout << "Core pions : " << nCore << "\n"
+     << "Halo pions : " << nHalo << "\n"
+     << "Halo fraction = " << double(nHalo)/(nCore+nHalo) << endl;
+
     
     //check particls at freeze out
    // 1. Declare histograms
@@ -358,7 +397,6 @@ cout << "Lambda: " << n_lambda << endl;
 cout << "K0S: " << n_k0s << endl;
 
 // 5. Draw histograms in separate pads
-// 5. Draw histograms in separate pads with labels and particle counts
 TCanvas* cEta = new TCanvas("cEta","Particle #eta distributions",1000,800);
 cEta->Divide(2,2); // 2x2 grid
 
@@ -443,6 +481,9 @@ TH1F* hT_all     = new TH1F("hT_all",     "t all #pi", 200, 0, 150);
 TH1F* hT_eta     = new TH1F("hT_eta",     "t #eta",    200, 0, 150);
 TH1F* hT_etap    = new TH1F("hT_etap",    "t #eta'",   200, 0, 150);
 TH1F* hT_lambda  = new TH1F("hT_lambda",  "t #Lambda", 200, 0, 150);
+TH1F* hT_raw = new TH1F("hT_raw","t_out",200,0,150);
+
+
 
 // Fill histograms
 for(const auto& p : particles)
@@ -450,14 +491,14 @@ for(const auto& p : particles)
     // --- Pions ---
     if(abs(p.pid) == 211){
         hT_all->Fill(p.t);
-        if(p.pid == 211)  hT_piplus->Fill(p.t);
-        if(p.pid == -211) hT_piminus->Fill(p.t);
+        if(p.pid == 211)  hT_piplus->Fill(p.tf);
+        if(p.pid == -211) hT_piminus->Fill(p.tf);
     }
 
     // --- Other particles ---
-    if(p.pid == 221)  hT_eta->Fill(p.t);
-    if(p.pid == 331)  hT_etap->Fill(p.t);
-    if(p.pid == 3122) hT_lambda->Fill(p.t);
+    if(p.pid == 221)  hT_eta->Fill(p.tf);
+    if(p.pid == 331)  hT_etap->Fill(p.tf);
+    if(p.pid == 3122) hT_lambda->Fill(p.tf);
 }
 
 // ==========================================
@@ -470,6 +511,7 @@ cTime->Divide(2,2);
 cTime->cd(1);
 //gPad->SetLogy();
 hT_piplus->GetYaxis()->SetTitle("Counts");
+hT_piplus->GetYaxis()->SetRangeUser(0, 3000);
 hT_piplus->SetLineColor(kRed);
 hT_piminus->SetLineColor(kBlue);
 hT_piminus->GetXaxis()->SetTitle("t [fm/c]");
@@ -490,6 +532,7 @@ hT_eta->SetLineColor(kMagenta);
 hT_eta->GetYaxis()->SetTitle("Counts");
 hT_eta->GetXaxis()->SetTitle("t [fm/c]");
 hT_eta->Draw("HIST");
+hT_eta->GetYaxis()->SetRangeUser(0, 1000);
 
 TLegend* legP = new TLegend(0.6,0.7,0.88,0.88);
 legP->SetBorderSize(0);
@@ -503,6 +546,7 @@ hT_etap->SetLineColor(kGreen+2);
 hT_etap->GetYaxis()->SetTitle("Counts");
 hT_etap->GetXaxis()->SetTitle("t [fm/c]");
 hT_etap->Draw("HIST");
+hT_etap->GetYaxis()->SetRangeUser(0, 100);
 
 TLegend* legp = new TLegend(0.6,0.7,0.88,0.88);
 legp->SetBorderSize(0);
@@ -516,6 +560,7 @@ hT_lambda->GetYaxis()->SetTitle("Counts");
 hT_lambda->SetLineColor(kOrange+7);
 hT_lambda->GetXaxis()->SetTitle("t [fm/c]");
 hT_lambda->Draw("HIST");
+hT_lambda->GetYaxis()->SetRangeUser(0, 100);
 
 TLegend* legl = new TLegend(0.6,0.7,0.88,0.88);
 legl->SetBorderSize(0);
@@ -707,10 +752,10 @@ ROOT::Math::Functor f(loglikfunc, NPAR);
         minimizer->SetFunction(f);
         minimizer->SetMaxFunctionCalls(50000);
         minimizer->SetMaxIterations(50000);
-        minimizer->SetTolerance(1e-6);
+        minimizer->SetTolerance(1e-4);
 
         // --- fitting parameters ---
-minimizer->SetLimitedVariable(0, "alpha", 1.5, 0.01, 0.5, 2.0);
+minimizer->SetLimitedVariable(0, "alpha", 1.5, 0.01, 0.5, 2.5);
 minimizer->SetLimitedVariable(1, "Rout",  4.0, 0.1, 1.0, 30.0);
 minimizer->SetLimitedVariable(2, "Rside", 2.0, 0.1, 1.0, 30.0);
 minimizer->SetLimitedVariable(3, "Rlong", 4.0, 0.1, 1.0, 30.0);
@@ -731,7 +776,7 @@ double mT = sqrt(kT_mean * kT_mean + m_pi * m_pi);
 
 // Store
 mt_vals.push_back(mT);
-mt_err.push_back(0.0);   // no error on mT (you can set to bin half‑width if needed)
+mt_err.push_back(0.0);   
 
 alpha_vals.push_back(p[0]);
 alpha_err.push_back(err[0]);
@@ -835,7 +880,7 @@ box->Draw();
         TPaveText* info = new TPaveText(0.65, 0.80, 0.95, 0.95, "NDC");
 
 info->SetFillStyle(0);     // transparent
-info->SetBorderSize(0);    // no border
+info->SetBorderSize(0);    
 info->SetTextSize(0.04);
 info->SetTextAlign(32);    // right-aligned text
 
@@ -861,7 +906,7 @@ TGraphErrors *gAlpha = new TGraphErrors(nPoints,
 gAlpha->SetTitle("#alpha vs m_{T}; m_{T} [GeV]; #alpha");
 gAlpha->SetMarkerStyle(20);
 gAlpha->SetMarkerColor(kBlack);
-gAlpha->GetHistogram()->GetYaxis()->SetRangeUser(1.5, 2.5);
+gAlpha->GetHistogram()->GetYaxis()->SetRangeUser(0.9, 2.0);
 gAlpha->Draw("AP");
 
 
@@ -896,8 +941,8 @@ gRlong->SetLineColor(kGreen+2);
 gPad->Update();
 
 // Set range
-gRout->GetHistogram()->GetYaxis()->SetRangeUser(4.0, 35.0);
-// Draw first graph to set axes, then overlay the others
+gRout->GetHistogram()->GetYaxis()->SetRangeUser(1.0, 15.0);
+
 gRout->Draw("AP");
 gRside->Draw("P SAME");
 gRlong->Draw("P SAME");
@@ -942,12 +987,11 @@ sysInfo->AddText(" ");
 sysInfo->AddText("Kinematic cuts:");
 sysInfo->AddText(Form("%.2f < p_{T} < %.2f GeV/c", pT_min, pT_max));
 sysInfo->AddText(Form("|#eta| < %.1f", eta_cut));
-sysInfo->AddText(Form("k_{T} range: %.2f - %.2f GeV/c",
-                kT_min_val, kT_max_val));
+
 sysInfo->Draw();
 
-// Optional: save the canvas
+// save the canvas
 c_mT->SaveAs("Proj3D_FitParameters_vs_mT.png");
-c_mT->Write();   // if you have a ROOT file open
+c_mT->Write();   
     
 }
