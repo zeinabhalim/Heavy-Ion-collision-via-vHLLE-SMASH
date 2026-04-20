@@ -1,19 +1,26 @@
-Version: 1.8
-
 General:
     Modus:          List
     Time_Step_Mode: None
     Delta_Time:     0.1
-    End_Time:       1000.0
+    End_Time:       300.0
     Randomseed:     -1
-    Nevents:        50
+    Nevents:        100
 
 Output:
     Particles:
-        Format:          ["Binary", "Oscar2013"]
+        Format: ["Oscar2013"]
+        Extended: true
+        Only_Final: "No"
+
+Collision_Term:
+    No_Collisions: false
+    Force_Decays_At_End: false
+    Include_Weak_And_EM_Decays_At_The_End: True
 
 Modi:
     List:
         File_Directory: "AuAu_RHIC200/sampler.out/cent0_5/"
         File_Prefix: "particle_lists_"
         Shift_Id: 0
+
+
