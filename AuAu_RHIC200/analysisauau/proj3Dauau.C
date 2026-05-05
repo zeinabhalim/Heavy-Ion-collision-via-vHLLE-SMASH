@@ -469,8 +469,8 @@ void auau3D()
     gStyle->SetOptTitle(0);
     TH1::AddDirectory(kFALSE);
 
-   //const char* oscar_file = "/home/zeinab/Documents/vhlle-smash/hybrid/AuAu_RHIC200/smash.out/cent0_5/particle_lists.oscar";
-        const char* oscar_file = "/home/zeinab/Documents/vhlle-smash/hybrid/AuAu_RHIC200/particle_listswithforcedeay1000fm10evesnts.oscar";
+  const char* oscar_file = "/home/zeinab/Documents/vhlle-smash/hybrid/AuAu_RHIC200/smash.out/cent0_5/particle_lists_30events.oscar";
+        //const char* oscar_file = "/home/zeinab/Documents/vhlle-smash/hybrid/AuAu_RHIC200/particle_listswithforcedeay1000fm10evesnts.oscar";
     
 
     // --- Load particles ---
@@ -489,10 +489,10 @@ for (auto& p : particles) {
     bool is_long_lived_ultimate = hasLongLivedAncestor(p, particleByID);
 
     if (is_long_lived_ultimate) {
-        p.xf = p.x;
-        p.yf = p.y;
-        p.zf = p.z;
-        p.tf = p.t;
+      p.xf = p.x;   
+    p.yf = p.y;
+    p.zf = p.z;
+    p.tf = p.t;
 
     } else {
         double dt = p.t - p.time_last_coll;
@@ -605,7 +605,7 @@ legl->SetFillStyle(0);
 legl->AddEntry(hT_lambda,"#Lambda","L");
 legl->Draw();
 
-cTime->SaveAs("Freezeout_time_all_speciesWforcedDeacy1000fm.png");
+cTime->SaveAs("Freezeout_time_all_speciesWforcedDeacy300fm.png");
 
 // ==========================================
 // Momentum distributions for IDENTICAL pions
@@ -693,7 +693,7 @@ legPz->AddEntry(hPz_piplus,"#pi^{+}","L");
 legPz->AddEntry(hPz_piminus,"#pi^{-}","L");
 legPz->Draw();
 
-cMomPi->SaveAs("Momentum_components_pionsWforcedDeacy1000fm.png");
+cMomPi->SaveAs("Momentum_components_pionsWforcedDeacy300fm.png");
 
 
 //========================================================================
@@ -925,7 +925,7 @@ info->AddText(Form("kT: %.2f-%.2f GeV/c", kT_min, kT_max));
 info->AddText(Form("N_{pairs} = %d", res.total_pairs));
 
 info->Draw();
-        c->SaveAs(Form("kT_%.2f-%.2f,WforcedDeacy1000fm.png", kT_min, kT_max));
+        c->SaveAs(Form("kT_%.2f-%.2f,WforcedDeacy300fm.png", kT_min, kT_max));
 
         delete minimizer;
     }
@@ -1028,7 +1028,7 @@ sysInfo->AddText(Form("|#eta| < %.1f", eta_cut));
 sysInfo->Draw();
 
 // save the canvas
-c_mT->SaveAs("Proj3D_FitParameters_vs_mTWforcedDeacy1000fm.png");
+c_mT->SaveAs("Proj3D_FitParameters_vs_mTWforcedDeacy300fm.png");
 c_mT->Write();   
     
 }
