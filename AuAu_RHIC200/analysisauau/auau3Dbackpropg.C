@@ -110,8 +110,9 @@ bool isHaloParent(int pdg)
     return (pdg == 221  ||  // eta
             pdg == 331  ||  // eta'
             pdg == 3122 ||  // Lambda
-           pdg == 310  ||  // K0S  
-            pdg == 311  ||   // K_0
+           pdg == 310  ||  // K0S 
+            pdg == 321  ||  // K± 
+           pdg == 311  ||   // K_0
             pdg == 130  ||   // K_L
             pdg == 3222 ||   // Sigma+
             pdg == 3212 ||   // Sigma0
@@ -119,8 +120,8 @@ bool isHaloParent(int pdg)
             pdg == 411  ||   // D+
             pdg == 421  ||   // D0
             pdg == 431  ||  // Ds
-            pdg == 111  ||  // pi0 
-            pdg == 321); // K±
+            pdg == 111); // pi0 
+          
 
 }
 
@@ -136,7 +137,11 @@ bool isCoreParent(int pdg)
             pdg == 333);     // phi
 }
 
-// Choose exactly one parent per pion to avoid double counting.
+// Choose exactly one parent per pion to avoid double counting from oscar file info.
+/*#!OSCAR2013Extended particle_lists t x y z mass p0 px py pz pdg ID charge ncoll form_time xsecfac proc_id_origin proc_type_origin time_last_coll pdg_mother1 pdg_mother2 baryon_number strangeness
+# Units: fm fm fm fm GeV GeV GeV GeV GeV none none e none fm none none none fm none none none none
+# SMASH-3.3*/
+
 int chooseOneParent(const Particle& p) {
     int m1 = std::abs(p.mom1);
     int m2 = std::abs(p.mom2);
@@ -459,36 +464,186 @@ std::cout << "K_L (130): " << getCount(130) << endl;
               << "\n";
 }
 
+//reading particles decay info. from smash input txt files
+struct ParticleInfo {
+    std::string name;
+    double mass;
+    double width;
+    std::vector<int> pdgs;
+};
+
+struct DecayChannel {
+    double br;
+    int L;
+    std::vector<std::string> daughters;
+};
+
+std::unordered_map<int, std::vector<DecayChannel>> decayTable;
+std::unordered_map<int, ParticleInfo> particleTable;
+std::unordered_map<std::string, int> nameToPDG;
+
+void LoadParticleTable(const std::string& filename)
+{
+    std::ifstream fin(filename);
+
+    if (!fin.is_open()) {
+        std::cerr << "Cannot open " << filename << std::endl;
+        return;
+    }
+
+    std::string line;
+
+    while (std::getline(fin, line)) {
+
+        // remove comments
+        size_t commentPos = line.find('#');
+        if (commentPos != std::string::npos)
+            line = line.substr(0, commentPos);
+
+        // skip empty lines
+        if (line.empty()) continue;
+
+        std::stringstream ss(line);
+
+        std::string name;
+        double mass, width;
+        std::string parity;
+
+        ss >> name >> mass >> width >> parity;
+
+        if (ss.fail()) continue;
+
+        ParticleInfo info;
+        info.name = name;
+        info.mass = mass;
+        info.width = width;
+
+        int pdg;
+
+        while (ss >> pdg) {
+            info.pdgs.push_back(pdg);
+
+            particleTable[std::abs(pdg)] = info;
+
+            nameToPDG[name] = std::abs(pdg);
+        }
+    }
+
+    std::cout << "Loaded "
+              << particleTable.size()
+              << " particle entries\n";
+}
+
+void LoadDecayModes(const std::string& filename)
+{
+    std::ifstream fin(filename);
+
+    if (!fin.is_open()) {
+        std::cerr << "Cannot open " << filename << std::endl;
+        return;
+    }
+
+    std::string line;
+
+    int currentParentPDG = 0;
+
+    while (std::getline(fin, line)) {
+
+        // remove comments
+        size_t commentPos = line.find('#');
+        if (commentPos != std::string::npos)
+            line = line.substr(0, commentPos);
+
+        if (line.empty()) continue;
+
+        // trim leading spaces
+        while (!line.empty() && isspace(line[0]))
+            line.erase(0,1);
+
+        if (line.empty()) continue;
+
+        // parent line
+        if (!isdigit(line[0]) && line[0] != '.') {
+
+            std::stringstream ss(line);
+
+            std::string parentName;
+            ss >> parentName;
+
+            auto it = nameToPDG.find(parentName);
+
+            if (it != nameToPDG.end())
+                currentParentPDG = it->second;
+            else
+                currentParentPDG = 0;
+
+            continue;
+        }
+
+        // decay channel line
+        if (currentParentPDG == 0)
+            continue;
+
+        std::stringstream ss(line);
+
+        DecayChannel ch;
+
+        ss >> ch.br >> ch.L;
+
+        std::string daughter;
+
+        while (ss >> daughter)
+            ch.daughters.push_back(daughter);
+
+        decayTable[currentParentPDG].push_back(ch);
+    }
+
+    std::cout << "Loaded "
+              << decayTable.size()
+              << " decay blocks\n";
+}
+
+
+constexpr double hbarc = 0.1973269804; // GeV fm
 TRandom3 rng(0);
 
-double properLifetimeFm(int pdg) {
-    pdg = std::abs(pdg);
-    switch (pdg) {
-        case 221:  return 0.78;      // eta
-        case 331:  return 1000.0;    // eta'
-        case 3122: return 7.89e4;    // Lambda
-        case 310:  return 2.68e4;    // K0S
-        case 3222:
-        case 3212:
-        case 3112: return 1e4;       // Sigma, approximate
-        case 411:  return 3.12e2;    // D+
-        case 421:  return 1.23e2;    // D0
-        case 431:  return 1.50e2;    // Ds
-        default:   return 0.0;
-    }
+double properLifetimeFmC(double widthGeV) {
+    if (widthGeV <= 0.0) return 1e30;
+    return hbarc / widthGeV;
 }
 
 double sampleDecayProperTime(double tau0) {
     return -tau0 * std::log(rng.Uniform());
 }
 
-bool isHaloSpecies(int pdg) {
+double lifetimeFromPDG(int pdg) {
     pdg = std::abs(pdg);
-    return (pdg == 221 || pdg == 331 || pdg == 3122 || pdg == 310 ||
-            pdg == 3222 || pdg == 3212 || pdg == 3112 ||
-            pdg == 411 || pdg == 421 || pdg == 431);
+    auto it = particleTable.find(pdg);
+    if (it == particleTable.end()) return 0.0;
+    return properLifetimeFmC(it->second.width);
 }
 
+void assignEmissionPoint(Particle& p, int parentPDG, bool halo) {
+    if (halo) {
+        double tau0 = lifetimeFromPDG(parentPDG);
+        if (tau0 <= 0.0) tau0 = 1e30;
+
+        double tauProper = sampleDecayProperTime(tau0);
+        double gamma = p.E / p.mass();
+        double dt = gamma * tauProper;
+
+        p.xf = p.x + p.betaX() * dt;
+        p.yf = p.y + p.betaY() * dt;
+        p.zf = p.z + p.betaZ() * dt;
+        p.tf = p.t + dt;
+    } else {
+        double dt = p.t - p.time_last_coll;
+        p.xf = p.x - p.betaX() * dt;
+        p.yf = p.y - p.betaY() * dt;
+        p.zf = p.z - p.betaZ() * dt;
+        p.tf = p.time_last_coll;
+    }
+}
 
 // ---------------------------
 // Main Function
@@ -504,71 +659,22 @@ void auau3D()
 const char* oscar_file = "/home/zeinab/Documents/vhlle-smash/hybrid/AuAu_RHIC200/particle_lists300fmfalseignoreforced40.oscar";
     
 
-   
+    LoadParticleTable("/home/zeinab/Documents/vhlle-smash/smash/input/particles.txt");
+    LoadDecayModes("/home/zeinab/Documents/vhlle-smash/smash/input/decaymodes.txt");
 
-   vector<Particle> particles = LoadOSCAR(oscar_file);
+    vector<Particle> particles = LoadOSCAR(oscar_file);
 
-
-// build the map
-std::map<int, const Particle*> particleByID;
-for (const auto& p : particles) {
-    particleByID[p.ID] = &p;
-}
-
-
-// ==========================================
-// Assign emission coordinates
-// ==========================================
-for (auto& p : particles) {
-
-    // only meaningful for pions
-    bool isHalo = hasLongLivedAncestor(p, particleByID);
-
-    // -------------------------------------------------
-    // HALO contribution:
-    // delayed decay vertex from long-lived parent
-    // -------------------------------------------------
-    if (isHalo) {
-
-        int parentPDG = findOriginalParent(p, particleByID);
-
-        double tau0 = properLifetimeFm(parentPDG);
-
-        // fallback if unknown
-        if (tau0 <= 0.0) {
-            tau0 = 1.0;
-        }
-
-        // sample proper decay time
-        double tauProper = sampleDecayProperTime(tau0);
-
-        // Lorentz dilation
-        double gamma = p.E / p.mass();
-
-        // lab-frame decay time
-        double dt = gamma * tauProper;
-
-        // propagate FORWARD
-        p.xf = p.x + p.betaX() * dt;
-        p.yf = p.y + p.betaY() * dt;
-        p.zf = p.z + p.betaZ() * dt;
-        p.tf = p.t + dt;
+    std::map<int, const Particle*> particleByID;
+    for (const auto& p : particles) {
+        particleByID[p.ID] = &p;
     }
 
-    // -------------------------------------------------
-    // CORE contribution:
-    // standard freezeout back-propagation
-    // -------------------------------------------------
-    else {
-
-        double dt = p.t - p.time_last_coll;
-
-        p.xf = p.x - p.betaX() * dt;
-        p.yf = p.y - p.betaY() * dt;
-        p.zf = p.z - p.betaZ() * dt;
-        p.tf = p.time_last_coll;
+    for (auto& p : particles) {
+        bool isHalo = hasLongLivedAncestor(p, particleByID);
+        int parentPDG = isHalo ? findOriginalParent(p, particleByID) : 0;
+        assignEmissionPoint(p, parentPDG, isHalo);
     }
-}
+
 
 SourceStats stats = CountPionSources(particles, particleByID);
 PrintSourceStats(stats);
