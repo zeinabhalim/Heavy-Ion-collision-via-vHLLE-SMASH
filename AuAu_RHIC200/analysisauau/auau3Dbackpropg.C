@@ -654,9 +654,7 @@ void auau3D()
     gStyle->SetOptTitle(0);
     TH1::AddDirectory(kFALSE);
 
-//const char* oscar_file = "/home/zeinab/Documents/vhlle-smash/hybrid/AuAu_RHIC200/smash.out/cent0_5/particle_lists.oscar";
-//const char* oscar_file = "/home/zeinab/Documents/vhlle-smash/hybrid/AuAu_RHIC200/particle_lists300fmForcedTrueIgnore.oscar";
-const char* oscar_file = "/home/zeinab/Documents/vhlle-smash/hybrid/AuAu_RHIC200/particle_lists300fmfalseignoreforced40.oscar";
+const char* oscar_file = "/home/zeinab/Documents/vhlle-smash/hybrid/AuAu_RHIC200/smash.out/cent0_5/particle_lists.oscar";
     
 
     LoadParticleTable("/home/zeinab/Documents/vhlle-smash/smash/input/particles.txt");
@@ -1039,7 +1037,7 @@ lambda_err.push_back(err[4]);
                TH1F* h = hdir[idir];
                
           // scalling 
-         h->Scale(1.0 / h->Integral(), "width");
+         h->Scale(1.0 / h->Integral(1,h->GetNbinsX()+1), "width");
           
            // Set the Range and Axis limits
            double xmin[3] = {0.1 , 0.1, 0.1};
