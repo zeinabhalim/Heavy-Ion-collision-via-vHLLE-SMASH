@@ -1033,7 +1033,10 @@ lambda_err.push_back(err[4]);
                c->cd(idir+1);
                gPad->SetLogx();
                gPad->SetLogy();
-
+               
+               gPad->SetLeftMargin(0.16);    // more space for D(rho)
+               gPad->SetBottomMargin(0.14);  // more space for rho labels
+               
                TH1F* h = hdir[idir];
                
           // scalling 
@@ -1052,7 +1055,20 @@ lambda_err.push_back(err[4]);
             res.hOut ->GetXaxis()->SetTitle("#rho_{out} [fm]");
             res.hSide->GetXaxis()->SetTitle("#rho_{side} [fm]");
             res.hLong->GetXaxis()->SetTitle("#rho_{long} [fm]");
-            
+            h->GetXaxis()->SetLabelSize(0.03);
+h->GetYaxis()->SetLabelSize(0.03);
+            // Axis title spacing
+h->GetXaxis()->SetTitleOffset(1.4);   // move rho labels farther from ticks
+h->GetYaxis()->SetTitleOffset(1.8);   // move D(rho) away from axis
+
+// Axis title size (optional)
+h->GetXaxis()->SetTitleSize(0.05);
+h->GetYaxis()->SetTitleSize(0.05);
+
+// Axis label size
+h->GetXaxis()->SetLabelSize(0.04);
+h->GetYaxis()->SetLabelSize(0.04);
+
             h->Draw("E");
   
          //Drawing fit function
@@ -1079,7 +1095,7 @@ box->AddText(Form("#alpha = %.3f #pm %.3f", p[0], err[0]));
 box->AddText(Form("R_{%s} = %.2f #pm %.2f fm", names[idir], p[idir+1], err[idir+1]));
 box->AddText(Form("#lambda = %.2f #pm %.2f", p[4], err[4]));
 box->AddText(Form("#chi^{2}/NDF = %.2f / %d", chi2, ndf));
-box->AddText(Form("C.L. = %.2f%%", CL*100));
+//box->AddText(Form("C.L. = %.2f%%", CL*100));
 
 box->Draw();
         }
@@ -1111,10 +1127,10 @@ c_mT->cd(1);
 TGraphErrors *gAlpha = new TGraphErrors(nPoints,
     &mt_vals[0], &alpha_vals[0],
     &mt_err[0],  &alpha_err[0]);
-gAlpha->SetTitle("#alpha vs m_{T}; m_{T} [GeV]; #alpha");
+gAlpha->SetTitle("#alpha vs m_{T}; m_{T} [GeV/c^{2}]; #alpha");
 gAlpha->SetMarkerStyle(20);
 gAlpha->SetMarkerColor(kBlack);
-gAlpha->GetHistogram()->GetYaxis()->SetRangeUser(0.5, 2.0);
+gAlpha->GetHistogram()->GetYaxis()->SetRangeUser(1.2, 2.0);
 gAlpha->Draw("AP");
 
 
@@ -1127,7 +1143,7 @@ TGraphErrors *gRout = new TGraphErrors(nPoints,
 gRout->SetMarkerStyle(21);
 gRout->SetMarkerColor(kRed);
 gRout->SetLineColor(kRed);
-gRout->SetTitle("HBT radii vs m_{T}; m_{T} [GeV]; R [fm]");
+gRout->SetTitle("HBT radii vs m_{T}; m_{T} [GeV/c^{2}]; R [fm]");
 
 TGraphErrors *gRside = new TGraphErrors(nPoints,
     &mt_vals[0], &Rside_vals[0],
@@ -1149,7 +1165,7 @@ gRlong->SetLineColor(kGreen+2);
 gPad->Update();
 
 // Set range
-gRout->GetHistogram()->GetYaxis()->SetRangeUser(0.5, 35.0);
+gRout->GetHistogram()->GetYaxis()->SetRangeUser(0.5, 25.0);
 
 gRout->Draw("AP");
 gRside->Draw("P SAME");
@@ -1169,7 +1185,7 @@ c_mT->cd(3);
 TGraphErrors *gLambda = new TGraphErrors(nPoints,
     &mt_vals[0], &lambda_vals[0],
     &mt_err[0],  &lambda_err[0]);
-gLambda->SetTitle("#lambda vs m_{T}; m_{T} [GeV]; #lambda");
+gLambda->SetTitle("#lambda vs m_{T}; m_{T} [GeV/c^{2}]; #lambda");
 gLambda->SetMarkerStyle(20);
 gLambda->SetMarkerColor(kBlack);
 gLambda->Draw("AP");
@@ -1183,7 +1199,7 @@ TPaveText *sysInfo = new TPaveText(0.10, 0.10, 0.90, 0.90, "NDC");
 sysInfo->SetTextSize(0.045);
 sysInfo->SetFillColor(0);
 sysInfo->SetBorderSize(1);
-sysInfo->SetTextFont(42);
+sysInfo->SetTextFont(40);
 sysInfo->SetTextAlign(12);
 
 sysInfo->AddText("System Information");
@@ -1201,5 +1217,152 @@ sysInfo->Draw();
 // save the canvas
 c_mT->SaveAs("Proj3D_FitParameters_vs_mTWforcedDeacy300fm.png");
 c_mT->Write();   
-    
+ // ==========================================
+// Separate canvas: alpha vs mT
+// ==========================================
+TCanvas *c_alpha = new TCanvas("c_alpha",
+                               "#alpha vs m_{T}",
+                               800, 700);
+
+c_alpha->SetLeftMargin(0.14);
+c_alpha->SetBottomMargin(0.14);
+c_alpha->SetTicks();
+
+TGraphErrors *gAlpha_only = new TGraphErrors(
+    nPoints,
+    &mt_vals[0], &alpha_vals[0],
+    &mt_err[0],  &alpha_err[0]);
+
+gAlpha_only->SetTitle("#alpha vs m_{T};m_{T} [GeV/c^{2}];#alpha");
+
+gAlpha_only->SetMarkerStyle(20);
+gAlpha_only->SetMarkerSize(1.2);
+gAlpha_only->SetMarkerColor(kBlack);
+gAlpha_only->SetLineColor(kBlack);
+
+gAlpha_only->GetXaxis()->SetTitleSize(0.05);
+gAlpha_only->GetYaxis()->SetTitleSize(0.05);
+
+gAlpha_only->GetXaxis()->SetLabelSize(0.045);
+gAlpha_only->GetYaxis()->SetLabelSize(0.045);
+
+gAlpha_only->GetXaxis()->SetTitleOffset(1.2);
+gAlpha_only->GetYaxis()->SetTitleOffset(1.4);
+
+gAlpha_only->GetYaxis()->SetRangeUser(1.35, 2.0);
+
+gAlpha_only->Draw("AP");
+// ==========================================
+// System info box for alpha canvas
+// ==========================================
+TPaveText *infoAlpha = new TPaveText(0.58, 0.68, 0.88, 0.88, "NDC");
+
+infoAlpha->SetFillStyle(0);
+infoAlpha->SetBorderSize(1);
+infoAlpha->SetTextFont(42);
+infoAlpha->SetTextSize(0.03);
+infoAlpha->SetTextAlign(12);
+
+infoAlpha->AddText(Form("%s", collision_system));
+infoAlpha->AddText(Form("#sqrt{s_{NN}} = %.0f GeV", sqrt_sNN));
+infoAlpha->AddText(Form("Centrality: %s", centrality));
+infoAlpha->AddText(Form("%.2f < p_{T} < %.2f GeV/c",
+                        pT_min, pT_max));
+infoAlpha->AddText(Form("|#eta| < %.1f", eta_cut));
+
+infoAlpha->Draw();
+c_alpha->SaveAs("alpha_vs_mT.png");
+
+// ==========================================
+// Separate canvas: HBT radii vs mT
+// ==========================================
+TCanvas *c_Radii = new TCanvas("c_Radii",
+                               "HBT Radii vs m_{T}",
+                               900, 700);
+
+c_Radii->SetLeftMargin(0.14);
+c_Radii->SetBottomMargin(0.14);
+c_Radii->SetTicks();
+
+TGraphErrors *gRout_only = new TGraphErrors(
+    nPoints,
+    &mt_vals[0], &Rout_vals[0],
+    &mt_err[0],  &Rout_err[0]);
+
+gRout_only->SetTitle("HBT radii vs m_{T};m_{T} [GeV/c^{2}];R [fm]");
+
+gRout_only->SetMarkerStyle(21);
+gRout_only->SetMarkerSize(1.2);
+gRout_only->SetMarkerColor(kRed);
+gRout_only->SetLineColor(kRed);
+
+gRout_only->GetXaxis()->SetTitleSize(0.05);
+gRout_only->GetYaxis()->SetTitleSize(0.05);
+
+gRout_only->GetXaxis()->SetLabelSize(0.045);
+gRout_only->GetYaxis()->SetLabelSize(0.045);
+
+gRout_only->GetXaxis()->SetTitleOffset(1.2);
+gRout_only->GetYaxis()->SetTitleOffset(1.4);
+
+gRout_only->GetYaxis()->SetRangeUser(0.5, 25.0);
+
+gRout_only->Draw("AP");
+
+// --- Rside
+TGraphErrors *gRside_only = new TGraphErrors(
+    nPoints,
+    &mt_vals[0], &Rside_vals[0],
+    &mt_err[0],  &Rside_err[0]);
+
+gRside_only->SetMarkerStyle(22);
+gRside_only->SetMarkerSize(1.2);
+gRside_only->SetMarkerColor(kBlue);
+gRside_only->SetLineColor(kBlue);
+
+gRside_only->Draw("P SAME");
+
+// --- Rlong
+TGraphErrors *gRlong_only = new TGraphErrors(
+    nPoints,
+    &mt_vals[0], &Rlong_vals[0],
+    &mt_err[0],  &Rlong_err[0]);
+
+gRlong_only->SetMarkerStyle(23);
+gRlong_only->SetMarkerSize(1.2);
+gRlong_only->SetMarkerColor(kGreen+2);
+gRlong_only->SetLineColor(kGreen+2);
+
+gRlong_only->Draw("P SAME");
+
+// Legend
+TLegend *legR = new TLegend(0.65,0.70,0.88,0.88);
+legR->SetBorderSize(0);
+legR->SetFillStyle(0);
+
+legR->AddEntry(gRout_only,  "R_{out}",  "P");
+legR->AddEntry(gRside_only, "R_{side}", "P");
+legR->AddEntry(gRlong_only, "R_{long}", "P");
+
+legR->Draw();
+// ==========================================
+// System info box for radii canvas
+// ==========================================
+TPaveText *infoR = new TPaveText(0.58, 0.50, 0.88, 0.68, "NDC");
+
+infoR->SetFillStyle(0);
+infoR->SetBorderSize(1);
+infoR->SetTextFont(42);
+infoR->SetTextSize(0.03);
+infoR->SetTextAlign(12);
+
+infoR->AddText(Form("%s", collision_system));
+infoR->AddText(Form("#sqrt{s_{NN}} = %.0f GeV", sqrt_sNN));
+infoR->AddText(Form("Centrality: %s", centrality));
+infoR->AddText(Form("%.2f < p_{T} < %.2f GeV/c",
+                    pT_min, pT_max));
+infoR->AddText(Form("|#eta| < %.1f", eta_cut));
+
+infoR->Draw();
+c_Radii->SaveAs("Radii_vs_mT.png");
 }
