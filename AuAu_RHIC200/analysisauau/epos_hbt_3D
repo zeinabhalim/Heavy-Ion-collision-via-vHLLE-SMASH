@@ -1,0 +1,664 @@
+// ============================================================
+// Au Au 200 Gev epos data analysis 
+// ============================================================
+#include <TFile.h>
+#include <TTree.h>
+#include <TChain.h>
+#include <TCanvas.h>
+#include <TH1F.h>
+#include <TF1.h>
+#include <TSystem.h>
+#include <TString.h>
+#include <TMath.h>
+#include <TStopwatch.h>
+#include <TGraphErrors.h>
+#include <TPaveText.h>
+#include <TLegend.h>
+#include <TLine.h>
+#include <iostream>
+#include <iomanip>
+#include <vector>
+#include <map>
+#include <cmath>
+#include <algorithm>
+using namespace std;
+
+// ============ Configuration ============
+const double m_pi = 0.13957;
+const double pT_min  = 0.15;
+const double pT_max  = 1.0;
+const double eta_cut = 1.0;
+const int    NPAR    = 5;
+
+// kT bins
+const double kT_bin_width = 0.05;
+const double kT_lo_edge   = 0.15;
+const double kT_hi_edge   = 0.85;
+const int    nBins_kT = (int)((kT_hi_edge - kT_lo_edge) / kT_bin_width);
+
+// Levy projection
+#include "Levy_proj_reader.h"
+Levy_reader* myLevy_reader;
+
+double LevyProj1DFunc(const double *x, const double *par) {
+    double alpha = par[0];
+    double R     = par[1];
+    double N     = par[2];
+    double Rcc   = R * pow(2., 1./alpha);
+    return (2.*N / Rcc) * myLevy_reader->getValue_1d(alpha, x[0]/Rcc);
+}
+
+// ============ LogLikelihood ============
+class LogLikelihood {
+public:
+    LogLikelihood(TH1F* hOut, TH1F* hSide, TH1F* hLong,
+                    double xmin, double xmax, int* binsUsed)
+    : hOut_(hOut), hSide_(hSide), hLong_(hLong),
+      xMin(xmin), xMax(xmax), nBinsUsed(binsUsed) {
+        *nBinsUsed = 0;
+        for (int idir=0; idir<3; ++idir) {
+            TH1F* h = (idir==0) ? hOut_ : (idir==1) ? hSide_ : hLong_;
+            for (int i=1; i<=h->GetNbinsX(); ++i) {
+                double xc = h->GetBinCenter(i);
+                if (xc >= xMin && xc <= xMax && h->GetBinContent(i) > 0)
+                    (*nBinsUsed)++;
+            }
+        }
+    }
+
+   double operator()(const double* par) const {
+    double alpha = par[0];
+    double Rout  = par[1];
+    double Rside = par[2];
+    double Rlong = par[3];
+    double N     = par[4];
+    double logL = 0;
+    TH1F* hists[3] = {hOut_, hSide_, hLong_};
+    double Rvals[3] = {Rout, Rside, Rlong};
+    for (int idir=0; idir<3; ++idir) {
+        TH1F* h = hists[idir];
+        double R = Rvals[idir];
+        for (int i=1; i<=h->GetNbinsX(); ++i) {
+            double xc = h->GetBinCenter(i);
+            if (xc < xMin || xc > xMax) continue;
+            double data = h->GetBinContent(i);
+            if (data <= 0) continue;
+            double pars[3] = {alpha, R, N};
+            double model = LevyProj1DFunc(&xc, pars);
+            if (model < 1e-30) model = 1e-30;
+            logL += data * log(model / data) + (data - model);
+        }
+    }
+    return -2.0 * logL;
+}
+
+private:
+    TH1F *hOut_, *hSide_, *hLong_;
+    double xMin, xMax;
+    int* nBinsUsed;
+};
+
+
+// ============ Main ============
+void epos_hbt_3D() {
+
+    gRandom->SetSeed(12345);
+    TStopwatch sw;
+    sw.Start();
+
+    // ---- Collect ROOT files READING ----
+    TString dir = gSystem->pwd();
+    TString cmd = Form("ls %s/z-gg2my59a-*.root", dir.Data());
+    TString filelist = gSystem->GetFromPipe(cmd);
+    TObjArray* tokens = filelist.Tokenize("\n");
+
+    vector<TString> filenames;
+    for (int i = 0; i < tokens->GetEntries(); i++) {
+        TString fn = tokens->At(i)->GetName();
+        if (!fn.Contains(".root")) continue;
+        if (fn.Contains("z-gg2my59a-261.root")) continue;
+        filenames.push_back(fn);
+    }
+    sort(filenames.begin(), filenames.end());
+    cout << "Found " << filenames.size() << " ROOT files" << endl;
+
+    // ---- Build TChain ----
+    TChain* chain = new TChain("teposevent0");
+    for (auto& fn : filenames) chain->Add(fn);
+
+    int    np_ch = 0;
+    const int MAXP = 200000;
+    float  px[MAXP], py[MAXP], pz[MAXP], e_ch[MAXP];
+    float  xr[MAXP], yr[MAXP], zr[MAXP], tr[MAXP];
+    int    id_ch[MAXP], ist_ch[MAXP];
+     
+    float xfr[MAXP], yfr[MAXP], zfr[MAXP], tfr[MAXP];    //frezzout frame channel
+
+    chain->SetBranchAddress("np",  &np_ch);
+    chain->SetBranchAddress("px",  px);
+    chain->SetBranchAddress("py",  py);
+    chain->SetBranchAddress("pz",  pz);
+    chain->SetBranchAddress("e",   e_ch);
+    chain->SetBranchAddress("x",   xr);
+    chain->SetBranchAddress("y",   yr);
+    chain->SetBranchAddress("z",   zr);
+    chain->SetBranchAddress("t",   tr);
+    chain->SetBranchAddress("id",  id_ch);
+    chain->SetBranchAddress("ist", ist_ch);
+     
+
+    // ---- Storage per kT bin ----
+    vector<double> kt_centers(nBins_kT);
+    for (int i = 0; i < nBins_kT; i++)
+        kt_centers[i] = kT_lo_edge + (i + 0.5) * kT_bin_width;
+       
+       chain->Print();
+
+    // ============ D(rho) histograms per kT bin ============
+    const int n_rho_bins = 300;
+    double rho_min = 0.1, rho_max = 1e15;
+    double rho_edges[n_rho_bins + 1];
+    double r_factor = pow(rho_max / rho_min, 1.0 / n_rho_bins);
+    rho_edges[0] = rho_min;
+    for (int i = 1; i <= n_rho_bins; i++) rho_edges[i] = rho_edges[i-1] * r_factor;
+
+    // ============ LOOP OVER EVENTS ============
+    long long nEntries = chain->GetEntries();
+    int nEvents = (int)nEntries;  // for display
+    cout << "Processing " << nEntries << " events..." << endl;
+
+    vector<TH1F*> hOut_all(nBins_kT), hSide_all(nBins_kT), hLong_all(nBins_kT);
+    for (int i = 0; i < nBins_kT; i++) {
+        hOut_all[i]  = new TH1F(Form("hOut_%d",i),  "", n_rho_bins, rho_edges);
+        hSide_all[i] = new TH1F(Form("hSide_%d",i), "", n_rho_bins, rho_edges);
+        hLong_all[i] = new TH1F(Form("hLong_%d",i), "", n_rho_bins, rho_edges);
+        hOut_all[i]->Sumw2();
+        hSide_all[i]->Sumw2();
+        hLong_all[i]->Sumw2();
+    }
+
+    long long total_pairs_all = 0;
+    int pair_count_per_bin[nBins_kT];
+    for (int i = 0; i < nBins_kT; i++) pair_count_per_bin[i] = 0;
+
+    for (long long ie = 0; ie < nEntries; ie++) {
+        chain->GetEntry(ie);
+        int npUse = min(np_ch, MAXP);
+
+        struct SimpleParticle {
+            float px, py, pz, E;
+            float x, y, z, t;
+             int id; 
+        };
+        vector<SimpleParticle> pions;
+
+        for (int ip = 0; ip < npUse; ip++) {
+            if (ist_ch[ip] != 0) continue;
+            if (id_ch[ip] != 120 && id_ch[ip] != -120) continue;
+            double pt  = sqrt(px[ip]*px[ip] + py[ip]*py[ip]);
+            double pp  = sqrt(px[ip]*px[ip] + py[ip]*py[ip] + pz[ip]*pz[ip]);
+            double eta = 0.5 * log((pp + pz[ip]) / (pp - pz[ip]));
+            if (pt < pT_min || pt > pT_max) continue;
+            if (fabs(eta) > eta_cut) continue;
+            
+            SimpleParticle sp;
+            sp.px = px[ip]; sp.py = py[ip]; sp.pz = pz[ip]; sp.E = e_ch[ip];
+            sp.x  = xr[ip]; sp.y  = yr[ip]; sp.z  = zr[ip]; sp.t  = tr[ip];
+            sp.id = id_ch[ip];      // store PDG code
+            pions.push_back(sp);
+        }
+
+        // Like-sign pairs
+        for (size_t i = 0; i < pions.size(); i++) {
+            const auto& p1 = pions[i];
+            for (size_t j = i+1; j < pions.size(); j++) {
+                const auto& p2 = pions[j];
+                
+                if (p1.id != p2.id) continue;
+
+                double kx = 0.5*(p1.px + p2.px);
+                double ky = 0.5*(p1.py + p2.py);
+                double kz = 0.5*(p1.pz + p2.pz);
+                double kT = sqrt(kx*kx + ky*ky);
+
+                int ibin = (int)((kT - kT_lo_edge) / kT_bin_width);
+                if (ibin < 0 || ibin >= nBins_kT) continue;
+
+                double mT = sqrt(kT*kT + m_pi*m_pi);
+                double qmCut = sqrt(0.2 * mT);
+
+                double qx = p1.px - p2.px;
+                double qy = p1.py - p2.py;
+                double qzL = (4*pow((p1.pz*p2.E - p2.pz*p1.E),2)) /
+                             (pow((p1.E+p2.E),2) - pow((p1.pz+p2.pz),2));
+                double qLCMS = sqrt(qx*qx + qy*qy + qzL);
+                if (qLCMS > qmCut) continue;
+
+double dx = p1.x - p2.x;
+double dy = p1.y - p2.y;
+double dz = p1.z - p2.z;
+double dt = p1.t - p2.t;
+
+
+double K0 = 0.5*(p1.E + p2.E);
+double kp = K0*K0 - kz*kz;
+double phi = atan2(ky, kx);
+
+double r_side = -sin(phi)*dx + cos(phi)*dy;
+//double r_out  = cos(phi)*dx + sin(phi)*dy  - (kT/kp) * (K0*dt - kz*dz);
+double r_out  = TMath::Cos(phi) * dx + TMath::Sin(phi) * dy;
+double r_long = (K0*dz - kz*dt) / sqrt(kp);
+
+
+                double rho = sqrt(r_out*r_out + r_side*r_side + r_long*r_long);
+                
+                hOut_all[ibin]->Fill(fabs(r_out));
+                hSide_all[ibin]->Fill(fabs(r_side));
+                hLong_all[ibin]->Fill(fabs(r_long));
+                pair_count_per_bin[ibin]++;
+                total_pairs_all++;
+            }
+        }
+
+        if ((ie+1) % 100 == 0)
+            cout << "  " << (ie+1) << "/" << nEntries << " events processed" << endl;
+    }
+
+    cout << "\nTotal pairs: " << total_pairs_all << endl;
+    cout << "\nPairs per kT bin:" << endl;
+    for (int i = 0; i < nBins_kT; i++) {
+        cout << "  kT=[" << kt_centers[i]-kT_bin_width/2 << "-"
+             << kt_centers[i]+kT_bin_width/2 << "]: "
+             << pair_count_per_bin[i] << " pairs" << endl;
+    }
+
+  myLevy_reader = new Levy_reader("levy_proj3D_values.dat");
+
+
+// ============ Storage for results ============
+vector<double> mt_vals, mt_err_vals;
+vector<double> alpha_vals, alpha_err_vals;
+vector<double> Rout_vals, Rout_err_vals;
+vector<double> Rside_vals, Rside_err_vals;
+vector<double> Rlong_vals, Rlong_err_vals;
+vector<double> lam_vals, lam_err_vals;
+vector<double> fitmax_vals;
+vector<double> logL_vals, ndf_vals;
+
+
+// ============ FIT EACH kT BIN ============
+cout << "\n=== FITTING D(rho) with Levy ===" << endl;
+
+double startSets[][5] = {
+    {1.0,  8.0, 3.0, 4.0, 1.0},
+    {1.3, 10.0, 2.5, 3.5, 0.8},
+    {1.6, 15.0, 4.0, 5.0, 1.2},
+    {1.9, 20.0, 3.5, 6.0, 0.6},
+    {2.2, 12.0, 2.0, 3.0, 1.4}
+};
+
+
+for (int ibin = 0; ibin < nBins_kT; ibin++) {
+    double kT_lo = kT_lo_edge + ibin * kT_bin_width;
+    double kT_hi = kT_lo + kT_bin_width;
+    double kT_m  = kt_centers[ibin];
+    double mT    = sqrt(kT_m*kT_m + m_pi*m_pi);
+    double fit_max = 100;
+    double fit_min = 0.1;
+
+
+
+    if (pair_count_per_bin[ibin] < 100) {
+        cout << "  kT=[" << kT_lo << "-" << kT_hi
+             << "] SKIPPED: only " << pair_count_per_bin[ibin] << " pairs" << endl;
+        continue;
+    }
+
+    // ============================================
+    // Check FIT STRATEGY 
+    // ============================================
+    // 1. Clone and normalize each direction histogram over the fit range
+    TH1F* hOutNorm = (TH1F*)hOut_all[ibin]->Clone();
+    TH1F* hSideNorm = (TH1F*)hSide_all[ibin]->Clone();
+    TH1F* hLongNorm = (TH1F*)hLong_all[ibin]->Clone();
+    hOutNorm->SetDirectory(0);
+    hSideNorm->SetDirectory(0);
+    hLongNorm->SetDirectory(0);
+
+    int binLow = hOutNorm->FindBin(fit_min);
+    int binHigh = hOutNorm->FindBin(fit_max);
+
+    double integralOut = hOutNorm->Integral(binLow, binHigh, "width");
+    double integralSide = hSideNorm->Integral(binLow, binHigh, "width");
+    double integralLong = hLongNorm->Integral(binLow, binHigh, "width");
+
+    if (integralOut > 0) hOutNorm->Scale(1.0 / integralOut, "width");
+    if (integralSide > 0) hSideNorm->Scale(1.0 / integralSide, "width");
+    if (integralLong > 0) hLongNorm->Scale(1.0 / integralLong, "width");
+
+    // 2. Build the likelihood function (5 parameters)
+    int actualBins = 0;
+    LogLikelihood loglikfunc(hOutNorm, hSideNorm, hLongNorm, fit_min, fit_max, &actualBins);
+
+    if (actualBins < 30) { // Need enough bins for a stable fit
+        cout << "  kT=[" << kT_lo << "-" << kT_hi
+             << "] SKIPPED: only " << actualBins << " bins with data" << endl;
+        delete hOutNorm;
+        delete hSideNorm;
+        delete hLongNorm;
+        continue;
+    }
+ROOT::Math::Functor f(loglikfunc, 5);  
+
+// 3. Try multiple starting points (as in SMASH)
+bool fitConverged = false;
+double bestChi2 = 1e30;
+double bestPar[5] = {0, 0, 0, 0, 0};
+double bestErr[5] = {0, 0, 0, 0, 0};
+
+
+for (int iattempt = 0; iattempt < 5; iattempt++) {
+    ROOT::Math::Minimizer* minimizer =
+        ROOT::Math::Factory::CreateMinimizer("Minuit2", "Migrad");
+    minimizer->SetFunction(f);
+    minimizer->SetMaxFunctionCalls(50000);
+    minimizer->SetMaxIterations(50000);
+    minimizer->SetTolerance(1e-4);
+    minimizer->SetStrategy(2);
+    minimizer->SetPrintLevel(-1);
+    
+    minimizer->SetLimitedVariable(0, "alpha", startSets[iattempt][0], 0.1, 0.5, 2.5);
+    minimizer->SetLimitedVariable(1, "Rout",  startSets[iattempt][1], 0.1, 0.5, 30.0);
+    minimizer->SetLimitedVariable(2, "Rside", startSets[iattempt][2], 0.1, 0.5, 30.0);
+    minimizer->SetLimitedVariable(3, "Rlong", startSets[iattempt][3], 0.1, 0.5, 30.0);
+    minimizer->SetLimitedVariable(4, "N",     startSets[iattempt][4], 0.01, 0.0, 1.5);
+
+    minimizer->Minimize();
+
+    if (minimizer->Status() == 0) {
+        double chi2val = minimizer->MinValue();
+        if (!fitConverged || chi2val < bestChi2) {
+            fitConverged = true;
+            bestChi2 = chi2val;
+            const double* px = minimizer->X();
+            const double* pe = minimizer->Errors();
+            for (int ip = 0; ip < 5; ip++) {
+                bestPar[ip] = px[ip];
+                bestErr[ip] = pe[ip];
+            }
+        }
+    }
+    delete minimizer;
+}
+// 4. Store results if fit converged
+if (fitConverged) {
+    mt_vals.push_back(mT);
+    mt_err_vals.push_back(0.0);
+
+    alpha_vals.push_back(bestPar[0]);
+    alpha_err_vals.push_back(bestErr[0]);
+
+    Rout_vals.push_back(bestPar[1]);
+    Rout_err_vals.push_back(bestErr[1]);
+
+    Rside_vals.push_back(bestPar[2]);
+    Rside_err_vals.push_back(bestErr[2]);
+
+    Rlong_vals.push_back(bestPar[3]);
+    Rlong_err_vals.push_back(bestErr[3]);
+
+    lam_vals.push_back(bestPar[4]);
+    lam_err_vals.push_back(bestErr[4]);
+
+    fitmax_vals.push_back(fit_max);
+
+    int ndf = actualBins - 5;  // 5 parameters
+    logL_vals.push_back(bestChi2);
+    ndf_vals.push_back(ndf);
+
+    cout << "  kT=[" << kT_lo << "-" << kT_hi << "] "
+         << pair_count_per_bin[ibin] << " pairs: "
+         << "alpha=" << bestPar[0] << "+-" << bestErr[0]
+         << "  Rout=" << bestPar[1] << "+-" << bestErr[1]
+         << "  Rside=" << bestPar[2] << "+-" << bestErr[2]
+         << "  Rlong=" << bestPar[3] << "+-" << bestErr[3]
+         << "  lambda=" << bestPar[4] << "+-" << bestErr[4]
+         << "  -logL/NDF=" << bestChi2 << "/" << ndf << endl;
+} else {
+    cout << "  kT=[" << kT_lo << "-" << kT_hi
+         << "] FIT FAILED to converge" << endl;
+}
+
+// 5. Clean up
+delete hOutNorm;
+delete hSideNorm;
+delete hLongNorm;
+}
+// ============================================================
+// DRAW D(rho) per kT bin (3-pad: out, side, long)
+// ============================================================
+string dirNames[3] = {"out", "side", "long"};
+
+
+for (int ibin = 0; ibin < nBins_kT; ibin++) {
+    if (pair_count_per_bin[ibin] < 100) continue;
+
+
+    double kT_lo = kT_lo_edge + ibin * kT_bin_width;
+    double kT_hi = kT_lo + kT_bin_width;
+    double kT_m  = kt_centers[ibin];
+    double mT    = sqrt(kT_m*kT_m + m_pi*m_pi);
+    double fit_max_disp = sqrt(2500.0 / mT);
+
+
+    // Find fit results for this bin
+    bool found = false;
+    for (size_t j = 0; j < mt_vals.size(); j++) {
+        if (fabs(mt_vals[j] - mT) < 0.01) {
+
+
+            TCanvas* cSample = new TCanvas(
+                Form("cDrho_kT%d", ibin),
+                Form("D(rho) with fit, kT=%.2f-%.2f GeV/c", kT_lo, kT_hi),
+                1800, 600);
+            cSample->Divide(3, 1);
+
+
+            TH1F* hists[3] = {hOut_all[ibin], hSide_all[ibin], hLong_all[ibin]};
+            double Rvals[3] = {Rout_vals[j], Rside_vals[j], Rlong_vals[j]};
+            double Rerrs[3] = {Rout_err_vals[j], Rside_err_vals[j], Rlong_err_vals[j]};
+
+
+            for (int idir = 0; idir < 3; idir++) {
+                cSample->cd(idir + 1);
+                gPad->SetLogx();
+                gPad->SetLogy();
+                gPad->SetLeftMargin(0.15);
+
+
+                // Clone, normalize over fit range, draw
+                TH1F* h = (TH1F*)hists[idir]->Clone();
+                h->SetDirectory(0);
+                int bLo = h->FindBin(rho_min);
+                int bHi = h->FindBin(fit_max_disp);
+                double intFit = h->Integral(bLo, bHi, "width");
+                if (intFit > 0) h->Scale(1.0 / intFit, "width");
+
+
+                h->SetMinimum(1e-25);
+                h->SetMaximum(1e0);
+                h->GetXaxis()->SetRangeUser(0.1, 1e15);
+                h->SetLineColor(kBlack);
+                h->SetLineWidth(1);
+                h->SetMarkerStyle(20);
+                h->SetMarkerSize(0.4);
+                h->SetMarkerColor(kBlack);
+                h->SetTitle(Form("D(#rho);#rho_{%s} [fm];D(#rho)",
+                                 dirNames[idir].c_str()));
+                h->Draw("E1");
+
+
+                // Draw Levy fit function
+                double pars[3] = {alpha_vals[j], Rvals[idir], lam_vals[j]};
+                TF1* func = new TF1(
+                    Form("func_%s_kT%d", dirNames[idir].c_str(), ibin),
+                    [&](double* x, double* par_fit) {
+                        return LevyProj1DFunc(x, par_fit);
+                    },
+                    0.1, 1e6, 3);
+                func->SetParameters(pars);
+                func->SetLineColor(kRed);
+                func->SetLineWidth(2);
+                func->Draw("SAME");
+
+
+                // Fit range vertical line
+                TLine* lFitMax = new TLine(fit_max_disp, 1e-25, fit_max_disp, 1e0);
+                lFitMax->SetLineColor(kGray + 2);
+                lFitMax->SetLineStyle(7);
+                lFitMax->Draw("SAME");
+            }
+
+
+            // ---- Info box on pad 3 (matching auau3D) ----
+            cSample->cd(3);
+            TPaveText* infoS = new TPaveText(0.55, 0.55, 0.89, 0.89, "NDC");
+            infoS->SetBorderSize(0);
+            infoS->SetFillStyle(0);
+            infoS->SetTextSize(0.035);
+            infoS->AddText(Form("#alpha = %.3f #pm %.3f", alpha_vals[j], alpha_err_vals[j]));
+            infoS->AddText(Form("R_{out} = %.2f #pm %.2f fm", Rout_vals[j], Rout_err_vals[j]));
+            infoS->AddText(Form("R_{side} = %.2f #pm %.2f fm", Rside_vals[j], Rside_err_vals[j]));
+            infoS->AddText(Form("R_{long} = %.2f #pm %.2f fm", Rlong_vals[j], Rlong_err_vals[j]));
+            infoS->AddText(Form("#lambda = %.3f #pm %.3f", lam_vals[j], lam_err_vals[j]));
+            infoS->AddText(Form("-logL/NDF: %.2f/%.0f", logL_vals[j], ndf_vals[j]));
+            infoS->Draw();
+
+
+            // ---- System info on pad 1 (matching auau3D) ----
+            cSample->cd(1);
+            TPaveText* infoSys = new TPaveText(0.55, 0.55, 0.89, 0.89, "NDC");
+            infoSys->SetBorderSize(0);
+            infoSys->SetFillStyle(0);
+            infoSys->SetTextSize(0.035);
+            infoSys->AddText(Form("kT: %.2f - %.2f GeV/c", kT_lo, kT_hi));
+            infoSys->AddText(Form("#rho_{fit}^{max} = %.1f fm", fit_max_disp));
+            infoSys->AddText(Form("N_{events} = %d", nEvents));
+            infoSys->AddText(Form("N_{pairs} = %d", pair_count_per_bin[ibin]));
+            infoSys->Draw();
+
+
+            cSample->SaveAs(Form("EPOS_Drho_kT%.2f_%.2f.png", kT_lo, kT_hi));
+            delete cSample;
+            found = true;
+            break;
+        }
+    }
+}
+cout << "\nSaved all D(rho) canvases" << endl;
+
+
+// ============================================================
+// mT vs fit parameters (4-pad, matching auau3D)
+// ============================================================
+int nPoints = mt_vals.size();
+if (nPoints >= 2) {
+    TCanvas* c_mT = new TCanvas("c_mT", "Fit Parameters vs m_T", 1600, 1200);
+    c_mT->Divide(2, 2);
+
+
+    vector<double> mt_e(nPoints, 0.0);
+
+
+    // Pad 1: alpha vs mT
+    c_mT->cd(1);
+    TGraphErrors* gAlpha = new TGraphErrors(nPoints,
+        &mt_vals[0], &alpha_vals[0],
+        &mt_e[0],    &alpha_err_vals[0]);
+    gAlpha->SetTitle("#alpha vs m_{T}; m_{T} [GeV/c^{2}]; #alpha");
+    gAlpha->SetMarkerStyle(20);
+    gAlpha->SetMarkerColor(kBlack);
+    gAlpha->GetHistogram()->GetYaxis()->SetRangeUser(0.5, 2.5);
+    gAlpha->Draw("AP");
+
+
+    // Pad 2: Radii vs mT
+    c_mT->cd(2);
+    TGraphErrors* gRout = new TGraphErrors(nPoints,
+        &mt_vals[0], &Rout_vals[0],
+        &mt_e[0],    &Rout_err_vals[0]);
+    gRout->SetMarkerStyle(21); gRout->SetMarkerColor(kRed);
+    gRout->SetLineColor(kRed);
+    gRout->SetTitle("HBT radii vs m_{T}; m_{T} [GeV/c^{2}]; R [fm]");
+
+
+    TGraphErrors* gRside = new TGraphErrors(nPoints,
+        &mt_vals[0], &Rside_vals[0],
+        &mt_e[0],    &Rside_err_vals[0]);
+    gRside->SetMarkerStyle(22); gRside->SetMarkerColor(kBlue);
+    gRside->SetLineColor(kBlue);
+
+
+    TGraphErrors* gRlong = new TGraphErrors(nPoints,
+        &mt_vals[0], &Rlong_vals[0],
+        &mt_e[0],    &Rlong_err_vals[0]);
+    gRlong->SetMarkerStyle(23); gRlong->SetMarkerColor(kGreen+2);
+    gRlong->SetLineColor(kGreen+2);
+
+
+    gRout->GetHistogram()->GetYaxis()->SetRangeUser(0.5, 35.0);
+    gRout->Draw("AP");
+    gRside->Draw("P SAME");
+    gRlong->Draw("P SAME");
+
+
+    TLegend* legR = new TLegend(0.65, 0.70, 0.88, 0.88);
+    legR->SetBorderSize(0); legR->SetFillStyle(0);
+    legR->AddEntry(gRout,  "R_{out}",  "P");
+    legR->AddEntry(gRside, "R_{side}", "P");
+    legR->AddEntry(gRlong, "R_{long}", "P");
+    legR->Draw();
+
+
+    // Pad 3: lambda vs mT
+    c_mT->cd(3);
+    TGraphErrors* gLambda = new TGraphErrors(nPoints,
+        &mt_vals[0], &lam_vals[0],
+        &mt_e[0],    &lam_err_vals[0]);
+    gLambda->SetTitle("#lambda vs m_{T}; m_{T} [GeV/c^{2}]; #lambda");
+    gLambda->SetMarkerStyle(20); gLambda->SetMarkerColor(kBlack);
+    gLambda->Draw("AP");
+
+
+    // Pad 4: system information
+    c_mT->cd(4);
+    gPad->SetFillColor(0); gPad->SetFrameBorderMode(0);
+    TPaveText* sysInfo = new TPaveText(0.10, 0.10, 0.90, 0.90, "NDC");
+    sysInfo->SetTextSize(0.045); sysInfo->SetFillColor(0);
+    sysInfo->SetBorderSize(1); sysInfo->SetTextFont(42); sysInfo->SetTextAlign(12);
+    sysInfo->AddText("System Information");
+    sysInfo->AddText("---------------------------");
+    sysInfo->AddText("EPOS Au+Au 0-5%");
+    sysInfo->AddText("#sqrt{s_{NN}} = 200 GeV");
+    sysInfo->AddText(" ");
+    sysInfo->AddText(Form("N_{events} = %d", nEvents));
+    sysInfo->AddText(Form("Total pairs: %lld", total_pairs_all));
+    sysInfo->AddText(Form("kT bins with fits: %d / %d", nPoints, nBins_kT));
+    sysInfo->AddText(" ");
+    sysInfo->AddText("Kinematic cuts:");
+    sysInfo->AddText(Form("%.2f < p_{T} < %.2f GeV/c", pT_min, pT_max));
+    sysInfo->AddText(Form("|#eta| < %.1f", eta_cut));
+    sysInfo->AddText(" ");
+    sysInfo->AddText("EPOS ID: #pi^{+} = 120, #pi^{-} = -120");
+    sysInfo->AddText("ist = 0 (final state)");
+    sysInfo->Draw();
+
+
+    c_mT->SaveAs("EPOS_mT_params_robust.png");
+    cout << "\nSaved: EPOS_mT_params_robust.png" << endl;
+}
+
+
+sw.Stop();
+sw.Print();
+}
