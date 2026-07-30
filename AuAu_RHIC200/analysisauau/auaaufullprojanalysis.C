@@ -424,6 +424,7 @@ HBTResults AnalyzePairs(const std::vector<Particle>& particles,
     res.hLong = hLong;
     res.hRho = hRho;
     res.total_pairs = pairs_count;
+    
     return res;
 }
 
@@ -531,6 +532,22 @@ void LoadParticleTable(const std::string& filename)
             //nameToPDG[name] = std::abs(pdg);
             nameToPDG[name] = pdg;
         }
+          // Greek-letter aliases for decay-mode daughter name resolution
+nameToPDG["π⁺"]  = 211;
+nameToPDG["π⁻"]  = -211;
+nameToPDG["π⁰"]  = 111;
+nameToPDG["γ"]   = 22;
+nameToPDG["η"]   = 221;
+nameToPDG["η'"]  = 331;
+nameToPDG["ω"]   = 223;
+nameToPDG["ρ⁰"]  = 113;
+nameToPDG["ρ⁺"]  = 213;
+nameToPDG["ρ⁻"]  = -213;
+nameToPDG["K⁺"]  = 321;
+nameToPDG["K⁻"]  = -321;
+nameToPDG["K⁰"]  = 311;
+nameToPDG["K̅⁰"]  = -311;   // anti-K0
+nameToPDG["σ"]   = 9000221;  // SMASH sigma
     }
 
     std::cout << "Loaded "
@@ -784,7 +801,7 @@ void auau3D()
     gStyle->SetOptTitle(0);
     TH1::AddDirectory(kFALSE);
 
-const char* oscar_file = "/home/zeinab/Documents/vhlle-smash/hybrid/AuAu_RHIC200/smash.out/cent0_5/particle_lists.oscar";
+const char* oscar_file = "/home/zeinab/Documents/vhlle-smash/hybrid/AuAu_RHIC200/backup800200smashrunsoscars/particle_lists_merged_1000.oscar";
     
 
     LoadParticleTable("/home/zeinab/Documents/vhlle-smash/smash/input/particles.txt");
@@ -870,197 +887,30 @@ for (auto& p : particles) {
 
 SourceStats stats = CountPionSources(particles, particleByID);
 PrintSourceStats(stats);
-// ==========================================
-// Freeze-out time distributions (multi-species)
-// ==========================================
 
-// Pions
-TH1F* hT_piplus  = new TH1F("hT_piplus",  "t #pi^{+}", 200, 0, 150);
-TH1F* hT_piminus = new TH1F("hT_piminus", "t #pi^{-}", 200, 0, 150);
-TH1F* hT_all     = new TH1F("hT_all",     "t all #pi", 200, 0, 150);
+//===================================
+//Select subsets of events by their ID
+//==================================
 
-// Other species
-TH1F* hT_eta     = new TH1F("hT_eta",     "t #eta",    200, 0, 150);
-TH1F* hT_etap    = new TH1F("hT_etap",    "t #eta'",   200, 0, 150);
-TH1F* hT_lambda  = new TH1F("hT_lambda",  "t #Lambda", 200, 0, 150);
-TH1F* hT_raw = new TH1F("hT_raw","t_out",200,0,150);
-
-
-
-// Fill histograms
-for(const auto& p : particles)
-{
-    // --- Pions ---
-    if(abs(p.pid) == 211){
-        hT_all->Fill(p.t);
-        if(p.pid == 211)  hT_piplus->Fill(p.tf);
-        if(p.pid == -211) hT_piminus->Fill(p.tf);
-    }
-
-    // --- Other particles ---
-    if(p.pid == 221)  hT_eta->Fill(p.tf);
-    if(p.pid == 331)  hT_etap->Fill(p.tf);
-    if(p.pid == 3122) hT_lambda->Fill(p.tf);
+/*vector<int> all_event_ids;
+for (const auto& p : particles) {
+    all_event_ids.push_back(p.event_id);
 }
+sort(all_event_ids.begin(), all_event_ids.end());
+all_event_ids.erase(unique(all_event_ids.begin(), all_event_ids.end()), all_event_ids.end());
+int total_events = all_event_ids.size();*/
 
-// ==========================================
-// Canvas
-// ==========================================
-TCanvas* cTime = new TCanvas("cTime", "Freeze-out time comparison", 1400, 1000);
-cTime->Divide(2,2);
-
-// ---  pi+ vs pi-
-cTime->cd(1);
-//gPad->SetLogy();
-hT_piplus->GetYaxis()->SetTitle("Counts");
-hT_piplus->GetYaxis()->SetRangeUser(0, 3000);
-hT_piplus->SetLineColor(kRed);
-hT_piminus->SetLineColor(kBlue);
-hT_piminus->GetXaxis()->SetTitle("t [fm/c]");
-hT_piplus->Draw("HIST");
-hT_piminus->Draw("HIST SAME");
-
-TLegend* legPi = new TLegend(0.6,0.7,0.88,0.88);
-legPi->SetBorderSize(0);
-legPi->SetFillStyle(0);
-legPi->AddEntry(hT_piplus,"#pi^{+}","L");
-legPi->AddEntry(hT_piminus,"#pi^{-}","L");
-legPi->Draw();
-
-// ---  eta
-cTime->cd(2);
-//gPad->SetLogy();
-hT_eta->SetLineColor(kMagenta);
-hT_eta->GetYaxis()->SetTitle("Counts");
-hT_eta->GetXaxis()->SetTitle("t [fm/c]");
-hT_eta->Draw("HIST");
-hT_eta->GetYaxis()->SetRangeUser(0, 1000);
-
-TLegend* legP = new TLegend(0.6,0.7,0.88,0.88);
-legP->SetBorderSize(0);
-legP->SetFillStyle(0);
-legP->AddEntry(hT_eta,"#eta","L");
-legP->Draw();
-
-// ---  eta meson
-cTime->cd(3);
-hT_etap->SetLineColor(kGreen+2);
-hT_etap->GetYaxis()->SetTitle("Counts");
-hT_etap->GetXaxis()->SetTitle("t [fm/c]");
-hT_etap->Draw("HIST");
-hT_etap->GetYaxis()->SetRangeUser(0, 100);
-
-TLegend* legp = new TLegend(0.6,0.7,0.88,0.88);
-legp->SetBorderSize(0);
-legp->SetFillStyle(0);
-legp->AddEntry(hT_etap,"#eta'","L");
-legp->Draw();
-
-// ---  Lambda
-cTime->cd(4);
-hT_lambda->GetYaxis()->SetTitle("Counts");
-hT_lambda->SetLineColor(kOrange+7);
-hT_lambda->GetXaxis()->SetTitle("t [fm/c]");
-hT_lambda->Draw("HIST");
-hT_lambda->GetYaxis()->SetRangeUser(0, 100);
-
-TLegend* legl = new TLegend(0.6,0.7,0.88,0.88);
-legl->SetBorderSize(0);
-legl->SetFillStyle(0);
-legl->AddEntry(hT_lambda,"#Lambda","L");
-legl->Draw();
-
-cTime->SaveAs("Freezeout_time_all_speciesWforcedDeacy300fm.png");
-
-// ==========================================
-// Momentum distributions for IDENTICAL pions
-// ==========================================
-
-// pi+
-TH1F* hPx_piplus = new TH1F("hPx_piplus","p_{x} #pi^{+}",200,-2,2);
-TH1F* hPy_piplus = new TH1F("hPy_piplus","p_{y} #pi^{+}",200,-2,2);
-TH1F* hPz_piplus = new TH1F("hPz_piplus","p_{z} #pi^{+}",200,-10,10);
-
-// pi-
-TH1F* hPx_piminus = new TH1F("hPx_piminus","p_{x} #pi^{-}",200,-2,2);
-TH1F* hPy_piminus = new TH1F("hPy_piminus","p_{y} #pi^{-}",200,-2,2);
-TH1F* hPz_piminus = new TH1F("hPz_piminus","p_{z} #pi^{-}",200,-10,10);
-
-for(const auto& p : particles)
-{
-    if(p.pid == 211){ // pi+
-        hPx_piplus->Fill(p.px);
-        hPy_piplus->Fill(p.py);
-        hPz_piplus->Fill(p.pz);
-    }
-
-    if(p.pid == -211){ // pi-
-        hPx_piminus->Fill(p.px);
-        hPy_piminus->Fill(p.py);
-        hPz_piminus->Fill(p.pz);
+vector<int> all_event_ids;
+set<int> seen;
+for (const auto& p : particles) {
+    if (seen.insert(p.event_id).second) {
+        all_event_ids.push_back(p.event_id);
     }
 }
-
-TCanvas* cMomPi = new TCanvas("cMomPi","Momentum components of pions",1200,400);
-cMomPi->Divide(3,1);
-//p_x
-cMomPi->cd(1);
-
-hPx_piplus->SetLineColor(kRed);
-hPx_piminus->SetLineColor(kBlue);
-
-hPx_piplus->GetXaxis()->SetTitle("p_{x} [GeV/c]");
-hPx_piplus->GetYaxis()->SetTitle("Counts");
-
-hPx_piplus->Draw("HIST");
-hPx_piminus->Draw("HIST SAME");
-
-TLegend* legPx = new TLegend(0.65,0.75,0.88,0.88);
-legPx->SetBorderSize(0);
-legPx->SetFillStyle(0);
-legPx->AddEntry(hPx_piplus,"#pi^{+}","L");
-legPx->AddEntry(hPx_piminus,"#pi^{-}","L");
-legPx->Draw();
-
-//p_y
-cMomPi->cd(2);
-
-hPy_piplus->SetLineColor(kRed);
-hPy_piminus->SetLineColor(kBlue);
-
-hPy_piplus->GetXaxis()->SetTitle("p_{y} [GeV/c]");
-
-hPy_piplus->Draw("HIST");
-hPy_piminus->Draw("HIST SAME");
-
-TLegend* legPy = new TLegend(0.65,0.75,0.88,0.88);
-legPy->SetBorderSize(0);
-legPy->SetFillStyle(0);
-legPy->AddEntry(hPy_piplus,"#pi^{+}","L");
-legPy->AddEntry(hPy_piminus,"#pi^{-}","L");
-legPy->Draw();
-
-//p_z
-cMomPi->cd(3);
-
-hPz_piplus->SetLineColor(kRed);
-hPz_piminus->SetLineColor(kBlue);
-
-hPz_piplus->GetXaxis()->SetTitle("p_{z} [GeV/c]");
-
-hPz_piplus->Draw("HIST");
-hPz_piminus->Draw("HIST SAME");
-
-TLegend* legPz = new TLegend(0.65,0.75,0.88,0.88);
-legPz->SetBorderSize(0);
-legPz->SetFillStyle(0);
-legPz->AddEntry(hPz_piplus,"#pi^{+}","L");
-legPz->AddEntry(hPz_piminus,"#pi^{-}","L");
-legPz->Draw();
-
-cMomPi->SaveAs("Momentum_components_pionsWforcedDeacy300fm.png");
+int total_events = all_event_ids.size();
 
 
+cout << "Found " << total_events << " unique events in sample." << endl;
 //========================================================================
 //ANALYSIS PAIRS section
 //=======================================================================
@@ -1100,11 +950,23 @@ vector<double> lambda_vals, lambda_err;
         // --- Analyze pairs in Kt ranges ---
 HBTResults res = AnalyzePairs(particles, particleByID, kT_min, kT_max, false);
 
-        // --- Fit range ---
-        const double fit_min = 0.1;
-        double fit_max_x[3] = {1000.0, 1000.0, 1000.0}; // out, side, long
-        const int NPAR = 5;
+if (res.total_pairs < 10) continue;
 
+
+        // --- Fit range ---
+const double fit_min = 0.1;
+double kT_mean = 0.5*(kT_min+kT_max);
+const double m_pi = 0.13957;
+double mT = sqrt(kT_mean*kT_mean + m_pi*m_pi);
+
+double fit_max = sqrt(2500.0/mT);
+
+double fit_max_x[3] = {
+    fit_max,
+    fit_max,
+    fit_max
+};
+        const int NPAR = 5;
 struct LogLikelihood {
     HBTResults res;
     double fit_min, fit_max_x[3];
@@ -1116,32 +978,42 @@ struct LogLikelihood {
     }
   
     double operator()(const double* p) const {
-        double logL = 0.0;
-        int currentBins = 0; 
-        
-        TH1F* hists[3] = {res.hOut, res.hSide, res.hLong};
+    double logL = 0.0;
+    int currentBins = 0;
 
-        for(int i=0; i<3; i++) {
-            double pars[3] = {p[0], p[i+1], p[4]};
-            double integral = hists[i]->Integral(0, hists[i]->GetNbinsX()+1); //NORMALIZATION 
+    TH1F* hists[3] = {res.hOut, res.hSide, res.hLong};
 
-            for(int b=1; b <= hists[i]->GetNbinsX(); b++) {
-                double x = hists[i]->GetBinCenter(b);
-                if(x < fit_min || x > fit_max_x[i]) continue;
+    for(int i=0; i<3; i++) {
+        double pars[3] = {p[0], p[i+1], p[4]};
 
-                double expected = LevyProj1DFunc(&x, pars) * hists[i]->GetBinWidth(b) * integral;
-                if(expected <= 1e-12) continue;
+        // Only count observed pairs WITHIN the fit range for normalization
+        int lo_bin = hists[i]->FindBin(fit_min);
+        int hi_bin = hists[i]->FindBin(fit_max_x[i]);
+        double integral = hists[i]->Integral(lo_bin, hi_bin);
+        if (integral <= 0) continue;
 
-                double observed = hists[i]->GetBinContent(b);
-                logL += (observed > 0) ? (expected - observed + observed * log(observed/expected)) : expected;
-                currentBins++;
-            }
+        for(int b = lo_bin; b <= hi_bin; b++) {
+            double x = hists[i]->GetBinCenter(b);
+            if (x < fit_min || x > fit_max_x[i]) continue;
+
+            double observed = hists[i]->GetBinContent(b);
+            if (observed <= 0) continue;
+
+            double expected = LevyProj1DFunc(&x, pars)
+                             * hists[i]->GetBinWidth(b) * integral;
+            if (expected <= 1e-12) expected = 1e-12;
+
+            logL += (expected - observed + observed * log(observed/expected));
+            currentBins++;
         }
-        
-        if (pBinsUsed) *pBinsUsed = currentBins; 
-        return logL;
     }
+
+    if (pBinsUsed) *pBinsUsed = currentBins;
+    return logL;
+}
 };
+
+
 
 //counting used bins 
 int actualBins = 0; 
@@ -1155,13 +1027,24 @@ ROOT::Math::Functor f(loglikfunc, NPAR);
         minimizer->SetMaxFunctionCalls(50000);
         minimizer->SetMaxIterations(50000);
         minimizer->SetTolerance(1e-4);
+        minimizer->SetStrategy(2);
 
         // --- fitting parameters ---
-minimizer->SetLimitedVariable(0, "alpha", 1.5, 0.01, 0.5, 2.5);
-minimizer->SetLimitedVariable(1, "Rout",  4.0, 0.1, 1.0, 30.0);
-minimizer->SetLimitedVariable(2, "Rside", 2.0, 0.1, 1.0, 30.0);
-minimizer->SetLimitedVariable(3, "Rlong", 4.0, 0.1, 1.0, 30.0);
-minimizer->SetLimitedVariable(4, "N",1.0, 0.01, 0.0, 1.5);
+minimizer->SetLimitedVariable(0, "alpha", 1.2, 0.01, 0.5, 2.5);
+
+minimizer->SetLimitedVariable(1, "Rout",
+                              6.0, 0.1,
+                              0.5, 50.0);
+
+minimizer->SetLimitedVariable(2, "Rside",
+                              4.0, 0.1,
+                              0.5, 50.0);
+
+minimizer->SetLimitedVariable(3, "Rlong",
+                              5.0, 0.1,
+                              0.5, 50.0);
+
+minimizer->SetLimitedVariable(4, "N", 0.9, 0.01, 0.3, 1.5);
 
         minimizer->Minimize();
 
@@ -1171,10 +1054,10 @@ minimizer->SetLimitedVariable(4, "N",1.0, 0.01, 0.0, 1.5);
        int ndf = actualBins - NPAR; 
        double CL = (ndf > 0) ? TMath::Prob(chi2, ndf) : 0;
        
-       // --- Compute mean kT and mT ---
+       /*/ --- Compute mean kT and mT ---
 double kT_mean = 0.5 * (kT_min + kT_max);
 const double m_pi = 0.13957; 
-double mT = sqrt(kT_mean * kT_mean + m_pi * m_pi);
+double mT = sqrt(kT_mean * kT_mean + m_pi * m_pi);*/
 
 // Store
 mt_vals.push_back(mT);
@@ -1231,7 +1114,12 @@ lambda_err.push_back(err[4]);
                TH1F* h = hdir[idir];
                
           // scalling 
-         h->Scale(1.0 / h->Integral(1,h->GetNbinsX()+1), "width");
+        // h->Scale(1.0 / h->Integral(1,h->GetNbinsX()+1), "width");
+        
+        double norm = h->Integral(1, h->GetNbinsX());
+
+if(norm>0)
+    h->Scale(1.0/norm,"width");
           
            // Set the Range and Axis limits
            double xmin[3] = {0.1 , 0.1, 0.1};
@@ -1260,6 +1148,23 @@ lambda_err.push_back(err[4]);
             flevy->SetLineColor(kRed);
             flevy->SetLineWidth(3);
             flevy->Draw("SAME");
+            
+            double ymin = h->GetMinimum();
+if(ymin<=0) ymin = 1e-25;
+
+double ymax = h->GetMaximum();
+
+TLine *fitLine =
+new TLine(fit_max,
+          ymin,
+          fit_max,
+          ymax);
+
+fitLine->SetLineStyle(2);
+fitLine->SetLineColor(kBlue+2);
+fitLine->SetLineWidth(2);
+
+fitLine->Draw("SAME");
 
             // fit Parameter box
             TPaveText* box = new TPaveText(0.35, 0.15, 0.65, 0.40, "NDC");
@@ -1274,7 +1179,7 @@ box->AddText(Form("R_{%s} = %.2f #pm %.2f fm", names[idir], p[idir+1], err[idir+
 box->AddText(Form("#lambda = %.2f #pm %.2f", p[4], err[4]));
 box->AddText(Form("#chi^{2}/NDF = %.2f / %d", chi2, ndf));
 box->AddText(Form("C.L. = %.2f%%", CL*100));
-
+box->AddText(Form("#rho_{max}=%.1f fm",fit_max));
 box->Draw();
         }
 
