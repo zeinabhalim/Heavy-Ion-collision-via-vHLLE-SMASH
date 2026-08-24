@@ -1,0 +1,1449 @@
+#include <TFile.h>
+#include <TCanvas.h>
+#include <TH1F.h>
+#include <TH2F.h>
+#include <TF1.h>
+#include <TLegend.h>
+#include <TPaveText.h>
+#include <TLine.h>
+#include <TMath.h>
+#include <TStyle.h>
+#include <RooFit.h>
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <map>
+#include <set>
+#include <tuple>
+#include <sstream>
+#include <iomanip>
+#include <TRandom3.h>
+#include "Levy_proj_reader.h"
+
+#include <TLorentzVector.h>
+#include <TGenPhaseSpace.h>
+
+#include <Math/Minimizer.h>
+#include <Math/Factory.h>
+#include <Math/Functor.h>
+
+using namespace std;
+
+Levy_reader* myLevy_reader;
+
+// ===============================
+// Levy projection
+// ===============================
+double LevyProj1DFunc(const double *x, const double *par)
+{
+    double alpha = par[0];
+    double R     = par[1];
+    double lambda = par[2];
+
+    double Rcc = R * pow(2., 1./alpha);
+
+    return (2.*lambda / Rcc) * myLevy_reader->getValue_1d(alpha, x[0]/Rcc);
+}
+
+// ===============================
+// Particle structure
+// ===============================
+struct Particle {
+    Int_t   event_id;
+    Int_t   pid;
+    Int_t   charge;
+    Int_t   ID;
+
+    Double_t px, py, pz, E;
+    Double_t x,  y,  z,  t;
+    Double_t xf, yf, zf, tf;
+    Double_t time_last_coll;
+    Int_t   proc_type;
+    Int_t proc_id_origin;
+
+    Double_t mass() const { return sqrt(E*E - (px*px + py*py + pz*pz)); }
+    Double_t pt()   const { return sqrt(px*px + py*py); }
+    Double_t p()    const { return sqrt(px*px + py*py + pz*pz); }
+    Double_t betaX() const { return px / E; }
+    Double_t betaY() const { return py / E; }
+    Double_t betaZ() const { return pz / E; }
+
+    Int_t mom1;
+    Int_t mom2;
+
+    Int_t ensemble_id = 0;
+    Int_t historyParentID  = 0;
+    Int_t historyParentPDG = 0;
+    Double_t productionX = 0.0, productionY = 0.0, productionZ = 0.0, productionT = 0.0;
+    bool hasHistoryProductionVertex = false;
+
+    Float_t pT() const { return TMath::Sqrt(px*px + py*py); }
+
+    Float_t eta() const {
+        Float_t p_abs = p();
+        if (p_abs <= fabs(pz)) return (pz > 0 ? 999.0 : -999.0);
+        return 0.5 * TMath::Log((p_abs + pz) / (p_abs - pz));
+    }
+};
+
+// ===============================
+// ParticleKey / ProductionInfo 
+// ===============================
+struct ParticleKey {
+    int event    = -1;
+    int ensemble = 0;
+    int id       = 0;
+    bool operator<(const ParticleKey& other) const {
+        return std::tie(event, ensemble, id) <
+               std::tie(other.event, other.ensemble, other.id);
+    }
+};
+
+ParticleKey MakeKey(const Particle& p)
+{
+    ParticleKey k;
+    k.event = p.event_id;
+    k.ensemble = p.ensemble_id;
+    k.id = p.ID;
+    return k;
+}
+
+struct ProductionInfo {
+    int parentID  = 0;
+    int parentPDG = 0;
+    double x = 0.0, y = 0.0, z = 0.0, t = 0.0;
+};
+
+bool isLongLivedParent(int pdg) {
+    pdg = std::abs(pdg);
+    return (pdg == 3122 ||    // Λ
+            pdg == 3222 || pdg == 3212 || pdg == 3112 ||  // Σ
+            pdg == 310  ||    // Kₛ⁰
+            pdg == 411  || pdg == 421 || pdg == 431);     // D mesons
+}
+
+bool hasLongLivedAncestor(const Particle& p,
+                         const std::map<int,const Particle*>& particleByID)
+{
+    for (int mid : {p.mom1, p.mom2}) {
+        if (mid == 0) continue;
+        auto it = particleByID.find(mid);
+        if (it == particleByID.end()) continue;
+        const Particle* parent = it->second;
+        int pdg = std::abs(parent->pid);
+        if (isLongLivedParent(pdg)) return true;
+        if (hasLongLivedAncestor(*parent, particleByID))
+            return true;
+    }
+    return false;
+}
+
+enum class SourceType { Direct, Core, Halo };
+
+bool isHaloParent(int pdg)
+{
+    pdg = std::abs(pdg);
+    return (pdg == 221  ||  // eta
+            pdg == 331  ||  // eta'
+            pdg == 3122 ||  // Lambda
+            pdg == 310  ||  // K0S
+            pdg == 321  ||  // K±
+            pdg == 311  ||   // K_0
+            pdg == 130  ||   // K_L
+            pdg == 3222 ||   // Sigma+
+            pdg == 3212 ||   // Sigma0
+            pdg == 3112 ||   // Sigma-
+            pdg == 411  ||   // D+
+            pdg == 421  ||   // D0
+            pdg == 431  ||  // Ds
+            pdg == 111); // pi0
+}
+
+bool isCoreParent(int pdg)
+{
+    pdg = std::abs(pdg);
+    return (pdg == 113  ||  // rho0
+            pdg == 213  ||
+            pdg == 2224 ||  // Delta++
+            pdg == 313  ||   // K*0
+            pdg == 323  ||   // K*+
+            pdg == 223  ||   // omega
+            pdg == 333);     // phi
+}
+
+int chooseOneParent(const Particle& p) {
+    int m1 = std::abs(p.mom1);
+    int m2 = std::abs(p.mom2);
+    if (m1 != 0 || m2 != 0) {
+        if (isHaloParent(m1)) return m1;
+        if (isHaloParent(m2)) return m2;
+        if (isCoreParent(m1)) return m1;
+        if (isCoreParent(m2)) return m2;
+        if (m1 != 0) return m1;
+        return m2;
+    } else if (p.proc_id_origin != 0) {
+        return std::abs(p.proc_id_origin);
+    }
+    return 0;
+}
+
+int findOriginalParent(const Particle& p,
+                       const std::map<int,const Particle*>& particleByID)
+{
+    int m1 = p.mom1;
+    int m2 = p.mom2;
+    for (int mid : {m1, m2}) {
+        if (mid == 0) continue;
+        auto it = particleByID.find(mid);
+        if (it == particleByID.end()) continue;
+        const Particle* parent = it->second;
+        int pdg = std::abs(parent->pid);
+        if (isHaloParent(pdg)) return pdg;
+        int higher = findOriginalParent(*parent, particleByID);
+        if (higher != 0) return higher;
+    }
+    return 0;
+}
+
+SourceType classifyPionSource(const Particle& p,
+                              const std::map<int,const Particle*>& particleByID)
+{
+    int parent = findOriginalParent(p, particleByID);
+    if (parent == 0) return SourceType::Direct;
+    if (isHaloParent(parent)) return SourceType::Halo;
+    return SourceType::Core;
+}
+
+struct SourceStats {
+    std::map<int,int> parentCounts;
+    int direct = 0;
+    int core = 0;
+    int halo = 0;
+};
+
+SourceStats CountPionSources(const std::vector<Particle>& particles,
+                             const std::map<int,const Particle*>&)
+{
+    SourceStats stats;
+    for (const auto& p : particles) {
+        if (std::abs(p.pid) != 211) continue;
+        int parent = chooseOneParent(p);
+        if (parent == 0) {
+            stats.direct++;
+            continue;
+        }
+        stats.parentCounts[parent]++;
+        if (isHaloParent(parent)) stats.halo++;
+        else stats.core++;
+    }
+    return stats;
+}
+
+//Filling from oscar file
+vector<Particle> LoadOSCAR(const char* fname)
+{
+    vector<Particle> particles;
+    ifstream fin(fname);
+    string line;
+    int event_id = -1;
+    int ensemble_id = 0;
+
+    while (getline(fin, line))
+    {
+        if (line.empty() || line[0] == '#') {
+            if (line.find("event") != string::npos) {
+                stringstream ss(line);
+                string tok;
+                event_id = -1;
+                ensemble_id = 0;
+                while (ss >> tok) {
+                    if (tok == "event") ss >> event_id;
+                    else if (tok == "ensemble") ss >> ensemble_id;
+                }
+            }
+            continue;
+        }
+
+        stringstream ss(line);
+        Particle p;
+        double mass, p0;
+        int pdg, ID, charge, ncoll;
+        double form_time;
+        double time_last_coll;
+        double xsecfac;
+        int proc_id_origin;
+        int proc_type_origin;
+        int pdg_mother1;
+        int pdg_mother2;
+        int baryon_number;
+        int strangeness;
+
+        ss >> p.t
+           >> p.x >> p.y >> p.z
+           >> mass >> p0
+           >> p.px >> p.py >> p.pz
+           >> pdg >> ID >> charge >> ncoll
+           >> form_time
+           >> xsecfac >> proc_id_origin >> proc_type_origin
+           >> time_last_coll
+           >> pdg_mother1 >> pdg_mother2
+           >> baryon_number >> strangeness;
+
+        if (ss.fail()) continue;
+
+        p.pid = pdg;
+        p.ID = ID;
+        p.charge = charge;
+        p.event_id = event_id;
+        p.ensemble_id = ensemble_id;
+        p.proc_type = proc_type_origin;
+        p.proc_id_origin = proc_id_origin;
+        p.mom1 = pdg_mother1;
+        p.mom2 = pdg_mother2;
+        p.time_last_coll = time_last_coll;
+
+        double p2 = p.px*p.px + p.py*p.py + p.pz*p.pz;
+        p.E = sqrt(p2 + mass*mass);
+
+        particles.push_back(p);
+    }
+
+    std::cout << "Loaded " << particles.size() << " particles\n";
+    return particles;
+}
+
+// ============================================================================
+// History parser , if avaliable
+// ============================================================================
+struct HistoryLine {
+    double t=0, x=0, y=0, z=0, mass=0, p0=0, px=0, py=0, pz=0;
+    int pdg=0, ID=0, charge=0, ncoll=0;
+    double form_time=0, xsecfac=0;
+    int proc_id_origin=0, proc_type_origin=0;
+    double time_last_coll=0;
+    int pdg_mother1=0, pdg_mother2=0;
+    int baryon_number=0, strangeness=0;
+};
+
+static bool ParseHistoryLine(const std::string& line, HistoryLine& hp)
+{
+    std::stringstream ss(line);
+    ss >> hp.t >> hp.x >> hp.y >> hp.z >> hp.mass >> hp.p0
+       >> hp.px >> hp.py >> hp.pz
+       >> hp.pdg >> hp.ID >> hp.charge >> hp.ncoll
+       >> hp.form_time >> hp.xsecfac >> hp.proc_id_origin >> hp.proc_type_origin
+       >> hp.time_last_coll >> hp.pdg_mother1 >> hp.pdg_mother2
+       >> hp.baryon_number >> hp.strangeness;
+    return !ss.fail();
+}
+
+void LoadDecayVertices(const char* fname,
+                        std::map<ParticleKey, ProductionInfo>& productionMap)
+{
+    std::ifstream fin(fname);
+    if (!fin.is_open()) {
+        std::cerr << "Cannot open " << fname << " -- skipping\n";
+        return;
+    }
+
+    std::string line;
+    int event_id = -1;
+    int ensemble_id = 0;
+
+    bool inBlock = false;
+    int nIn = 0, nOut = 0;
+    int readIn = 0, readOut = 0;
+    std::vector<HistoryLine> incoming;
+    long nBlocks = 0;
+
+    while (std::getline(fin, line)) {
+        if (line.empty()) continue;
+
+        if (line[0] == '#') {
+            if (line.find("event") != std::string::npos &&
+                line.find("ensemble") != std::string::npos) {
+                std::stringstream ss(line);
+                std::string tok;
+                while (ss >> tok) {
+                    if (tok == "event") ss >> event_id;
+                    else if (tok == "ensemble") ss >> ensemble_id;
+                }
+                inBlock = false;
+                continue;
+            }
+            if (line.find("interaction") != std::string::npos) {
+                std::stringstream ss(line);
+                std::string tok;
+                nIn = 0; nOut = 0;
+                while (ss >> tok) {
+                    if (tok == "in") ss >> nIn;
+                    else if (tok == "out") ss >> nOut;
+                }
+                incoming.clear();
+                readIn = 0; readOut = 0;
+                inBlock = (nIn > 0);
+                if (inBlock) nBlocks++;
+                continue;
+            }
+            continue;
+        }
+
+        HistoryLine hp;
+        if (!ParseHistoryLine(line, hp)) continue;
+
+        if (inBlock && readIn < nIn) {
+            incoming.push_back(hp);
+            readIn++;
+            if (readIn == nIn && nOut == 0) inBlock = false;
+            continue;
+        }
+
+        if (inBlock && readIn == nIn && readOut < nOut) {
+            ParticleKey key{event_id, ensemble_id, hp.ID};
+            ProductionInfo info;
+            info.x = hp.x; info.y = hp.y; info.z = hp.z; info.t = hp.t;
+
+            if (nIn == 1) {
+                info.parentID  = incoming[0].ID;
+                info.parentPDG = incoming[0].pdg;
+            } else {
+                int candidatePDG = hp.pdg_mother1 != 0 ? hp.pdg_mother1 : hp.pdg_mother2;
+                info.parentPDG = candidatePDG;
+                info.parentID = 0;
+                int nMatches = 0;
+                for (const auto& in_p : incoming)
+                    if (in_p.pdg == candidatePDG) { info.parentID = in_p.ID; nMatches++; }
+                if (nMatches != 1) info.parentID = 0;
+            }
+
+            productionMap[key] = info;
+            readOut++;
+            if (readOut == nOut) inBlock = false;
+            continue;
+        }
+    }
+
+    std::cout << "Parsed " << nBlocks << " interaction blocks from " << fname
+              << " -> " << productionMap.size() << " daughter vertex records\n";
+}
+
+void MatchHistoryVertices(std::vector<Particle>& particles,
+                           const std::map<ParticleKey, ProductionInfo>& productionMap)
+{
+    int matched = 0;
+    for (auto& p : particles) {
+        auto it = productionMap.find(MakeKey(p));
+        if (it == productionMap.end()) continue;
+
+        p.productionX = it->second.x;
+        p.productionY = it->second.y;
+        p.productionZ = it->second.z;
+        p.productionT = it->second.t;
+        p.historyParentID  = it->second.parentID;
+        p.historyParentPDG = it->second.parentPDG;
+        p.hasHistoryProductionVertex = true;
+        matched++;
+    }
+    std::cout << "Matched " << matched << " / " << particles.size()
+              << " final-state particles to history vertices\n";
+}
+
+// =========================================
+// Configuration
+// =========================================
+const char* collision_system = "Au Au";
+const char* centrality = "0-5%";
+double sqrt_sNN = 200;
+
+double pT_min = 0.15;
+double pT_max = 1.0;
+double eta_cut = 1.0;
+
+// ===============================
+// HBTResults structure
+// ===============================
+struct HBTResults {
+    TH1F* hOut;
+    TH1F* hSide;
+    TH1F* hLong;
+    TH1F* hRho;
+    int total_pairs;
+};
+
+// ===============================
+// Analyze pairs (unchanged)
+// ===============================
+HBTResults AnalyzePairs(const std::vector<Particle>& particles,
+                        const std::map<int,const Particle*>& particleByID,
+                        double kT_min,
+                        double kT_max,
+                        bool useCoreOnly = false)
+{
+    std::map<int, std::vector<Particle>> events;
+
+    for (const auto& p : particles) {
+        if (std::abs(p.pid) != 211) continue;
+        if (useCoreOnly && classifyPionSource(p, particleByID) == SourceType::Halo)
+            continue;
+        events[p.event_id].push_back(p);
+    }
+
+    const int n_bins = 300;
+    double rho_min = 0.1;
+    double rho_max = 1e15;
+    double bins[n_bins + 1];
+
+    double r = pow(rho_max / rho_min, 1.0 / n_bins);
+    bins[0] = rho_min;
+    for (int i = 1; i <= n_bins; i++) bins[i] = bins[i - 1] * r;
+
+    TH1F* hRho  = new TH1F("hRho",  "D(#rho)", n_bins, bins);
+    TH1F* hOut  = new TH1F("hOut",  "", n_bins, bins);
+    TH1F* hSide = new TH1F("hSide", "", n_bins, bins);
+    TH1F* hLong = new TH1F("hLong", "", n_bins, bins);
+
+    hRho->Sumw2();
+    hOut->Sumw2();
+    hSide->Sumw2();
+    hLong->Sumw2();
+
+    int pairs_count = 0;
+
+    for (auto& ev : events) {
+        const auto& v = ev.second;
+
+        for (size_t i = 0; i < v.size(); ++i) {
+            const Particle& p1 = v[i];
+
+            if (p1.pT() < pT_min || p1.pT() > pT_max) continue;
+            if (fabs(p1.eta()) > 1.0) continue;
+
+            for (size_t j = i + 1; j < v.size(); ++j) {
+                const Particle& p2 = v[j];
+
+                if (p2.pT() < pT_min || p2.pT() > pT_max) continue;
+                if (fabs(p2.eta()) > 1.0) continue;
+
+                if (p1.pid != p2.pid) continue; // like-sign only
+
+                double kx = 0.5 * (p1.px + p2.px);
+                double ky = 0.5 * (p1.py + p2.py);
+                double kz = 0.5 * (p1.pz + p2.pz);
+                double kT = TMath::Sqrt(kx*kx + ky*ky);
+
+                if (kT < kT_min || kT > kT_max) continue;
+
+                double mpi = 0.13957;
+                double mT = sqrt(kT*kT + mpi*mpi);
+                double qmCut = sqrt(0.2 * mT);
+
+                double qx = p1.px - p2.px;
+                double qy = p1.py - p2.py;
+                double qzL = (4*pow((p1.pz*p2.E - p2.pz*p1.E),2)) /
+                             (pow((p1.E+p2.E),2) - pow((p1.pz+p2.pz),2));
+                double qLCMS = TMath::Sqrt(qx*qx + qy*qy + qzL);
+
+                if (qLCMS > qmCut) continue;
+
+                pairs_count++;
+
+                double dx = p1.xf - p2.xf;
+                double dy = p1.yf - p2.yf;
+                double dz = p1.zf - p2.zf;
+                double dt = p1.tf - p2.tf;
+
+                double K0 = 0.5 * (p1.E + p2.E);
+                double kp = K0*K0 - kz*kz;
+                double phi = atan2(ky, kx);
+
+                double r_out  = TMath::Cos(phi) * dx + TMath::Sin(phi) * dy
+                              - (kT/kp) * (K0*dt - kz*dz);
+                double r_side = -TMath::Sin(phi) * dx + TMath::Cos(phi) * dy;
+                double r_long = (K0*dz - kz*dt) / sqrt(kp);
+
+                double rho = sqrt(r_out*r_out + r_side*r_side + r_long*r_long);
+
+                hRho->Fill(rho);
+                hOut->Fill(fabs(r_out));
+                hSide->Fill(fabs(r_side));
+                hLong->Fill(fabs(r_long));
+            }
+        }
+    }
+
+    HBTResults res;
+    res.hOut = hOut;
+    res.hSide = hSide;
+    res.hLong = hLong;
+    res.hRho = hRho;
+    res.total_pairs = pairs_count;
+
+    return res;
+}
+
+void PrintSourceStats(const SourceStats& stats)
+{
+    auto getCount = [&](int pdg) {
+        auto it = stats.parentCounts.find(pdg);
+        return (it == stats.parentCounts.end()) ? 0 : it->second;
+    };
+
+    std::cout << "\nPion sources from immediate parent PDG:\n";
+    std::cout << "--------------------------------------\n";
+    std::cout << "  eta (221): "     << getCount(221)   << " pions\n";
+    std::cout << "  eta' (331): "    << getCount(331)   << " pions\n";
+    std::cout << "  Lambda (3122): "  << getCount(3122)  << " pions\n";
+    std::cout << "  K0S (310): "      << getCount(310)   << " pions\n";
+    std::cout << "  omega (223): "    << getCount(223)   << " pions\n";
+    std::cout << "  phi (333): "      << getCount(333)   << " pions\n";
+    std::cout << "  D+ (411): "       << getCount(411)   << " pions\n";
+    std::cout << "  D0 (421): "       << getCount(421)   << " pions\n";
+    std::cout << "  Ds (431): "       << getCount(431)   << " pions\n";
+    std::cout << "  rho0 (113): "     << getCount(113)   << " pions\n";
+    std::cout << "  Delta++ (2224): "  << getCount(2224)  << " pions\n";
+    std::cout << "  K*0 (313): "      << getCount(313)   << " pions\n";
+    std::cout << "  Sigma+ (3222): "   << getCount(3222)  << " pions\n";
+    std::cout << "  rho+ (213): "     << getCount(213)   << " pions\n";
+    std::cout << "  K*+ (323): "      << getCount(323)   << " pions\n";
+    std::cout << "  Sigma- (3112): "  << getCount(3112)  << " pions\n";
+    std::cout << "  Sigma0 (3212): "  << getCount(3212)  << " pions\n";
+    std::cout << "  K0 (311): "       << getCount(311)   << "\n";
+    std::cout << "  K_L (130): "      << getCount(130)   << "\n";
+    std::cout << "  direct pions: "   << stats.direct    << "\n";
+    std::cout << "  core pions: "     << stats.core      << "\n";
+    std::cout << "  halo pions: "     << stats.halo      << "\n";
+
+    int total = stats.direct + stats.core + stats.halo;
+    std::cout << "  halo fraction = "
+              << (total > 0 ? double(stats.halo) / total : 0.0) << "\n";
+}
+
+//reading particles decay info. from smash input txt files
+struct ParticleInfo {
+    std::string name;
+    double mass;
+    double width;
+    std::vector<int> pdgs;
+};
+
+struct DecayChannel {
+    double br;
+    int L;
+    std::vector<std::string> daughters;
+};
+
+std::unordered_map<int, std::vector<DecayChannel>> decayTable;
+std::unordered_map<int, ParticleInfo> particleTable;
+std::unordered_map<std::string, int> nameToPDG;
+
+void LoadParticleTable(const std::string& filename)
+{
+    std::ifstream fin(filename);
+
+    if (!fin.is_open()) {
+        std::cerr << "Cannot open " << filename << std::endl;
+        return;
+    }
+
+    std::string line;
+
+    while (std::getline(fin, line)) {
+
+        size_t commentPos = line.find('#');
+        if (commentPos != std::string::npos)
+            line = line.substr(0, commentPos);
+
+        if (line.empty()) continue;
+
+        std::stringstream ss(line);
+
+        std::string name;
+        double mass, width;
+        std::string parity;
+
+        ss >> name >> mass >> width >> parity;
+
+        if (ss.fail()) continue;
+
+        ParticleInfo info;
+        info.name = name;
+        info.mass = mass;
+        info.width = width;
+
+        int pdg;
+
+        while (ss >> pdg) {
+            info.pdgs.push_back(pdg);
+
+            particleTable[std::abs(pdg)] = info;
+
+            nameToPDG[name] = pdg;
+        }
+          // Greek-letter aliases for decay-mode daughter name resolution
+nameToPDG["π⁺"]  = 211;
+nameToPDG["eta"] = 221;
+nameToPDG["π⁻"]  = -211;
+nameToPDG["π⁰"]  = 111;
+nameToPDG["γ"]   = 22;
+nameToPDG["η"]   = 221;
+nameToPDG["η'"]  = 331;
+nameToPDG["ω"]   = 223;
+nameToPDG["ρ⁰"]  = 113;
+nameToPDG["ρ⁺"]  = 213;
+nameToPDG["ρ⁻"]  = -213;
+nameToPDG["K⁺"]  = 321;
+nameToPDG["K⁻"]  = -321;
+nameToPDG["K⁰"]  = 311;
+nameToPDG["K̅⁰"]  = -311;   // anti-K0
+nameToPDG["σ"]   = 9000221;  // SMASH sigma
+    }
+
+    std::cout << "Loaded "
+              << particleTable.size()
+              << " particle entries\n";
+}
+
+void LoadDecayModes(const std::string& filename)
+{
+    std::ifstream fin(filename);
+
+    if (!fin.is_open()) {
+        std::cerr << "Cannot open " << filename << std::endl;
+        return;
+    }
+
+    std::string line;
+
+    int currentParentPDG = 0;
+
+    while (std::getline(fin, line)) {
+
+        size_t commentPos = line.find('#');
+        if (commentPos != std::string::npos)
+            line = line.substr(0, commentPos);
+
+        if (line.empty()) continue;
+
+        while (!line.empty() && isspace(line[0]))
+            line.erase(0,1);
+
+        if (line.empty()) continue;
+
+        if (!isdigit(line[0]) && line[0] != '.') {
+
+            std::stringstream ss(line);
+
+            std::string parentName;
+            ss >> parentName;
+
+            auto it = nameToPDG.find(parentName);
+
+            if (it != nameToPDG.end())
+                currentParentPDG = it->second;
+            else
+                currentParentPDG = 0;
+
+            continue;
+        }
+
+        if (currentParentPDG == 0)
+            continue;
+
+        std::stringstream ss(line);
+
+        DecayChannel ch;
+
+        ss >> ch.br >> ch.L;
+
+        std::string daughter;
+
+        while (ss >> daughter)
+            ch.daughters.push_back(daughter);
+
+        decayTable[currentParentPDG].push_back(ch);
+    }
+
+    std::cout << "Loaded "
+              << decayTable.size()
+              << " decay blocks\n";
+}
+
+constexpr double hbarc = 0.1973269804; // GeV fm
+TRandom3 rng(0);
+
+double properLifetimeFmC(double widthGeV) {
+    if (widthGeV <= 0.0) return 1e30;
+    return hbarc / widthGeV;
+}
+
+double sampleDecayProperTime(double tau0) {
+    return -tau0 * std::log(rng.Uniform());
+}
+
+double lifetimeFromPDG(int pdg) {
+    pdg = std::abs(pdg);
+    auto it = particleTable.find(pdg);
+    if (it == particleTable.end()) return 0.0;
+    return properLifetimeFmC(it->second.width);
+}
+
+void assignEmissionPoint(Particle& p, int parentPDG, bool halo) {
+
+    if (p.hasHistoryProductionVertex) {
+        p.xf = p.productionX;
+        p.yf = p.productionY;
+        p.zf = p.productionZ;
+        p.tf = p.productionT;
+        return;
+    }
+
+    if (halo) {
+        double tau0 = lifetimeFromPDG(parentPDG);
+        if (tau0 <= 0.0) tau0 = 1e30;
+
+        double tauProper = sampleDecayProperTime(tau0);
+        double gamma = p.E / p.mass();
+        double dt = gamma * tauProper;
+
+        p.xf = p.x + p.betaX() * dt;
+        p.yf = p.y + p.betaY() * dt;
+        p.zf = p.z + p.betaZ() * dt;
+        p.tf = p.t + dt;
+    } else {
+        double dt = p.t - p.time_last_coll;
+        p.xf = p.x - p.betaX() * dt;
+        p.yf = p.y - p.betaY() * dt;
+        p.zf = p.z - p.betaZ() * dt;
+        p.tf = p.time_last_coll;
+    }
+}
+
+void DecayEtaParticles(const Particle& eta,
+                       std::vector<Particle>& daughters,
+                       int& nextID,
+                       int event_id)
+{
+    auto it = decayTable.find(221);
+    if (it == decayTable.end()) return;
+    const auto& channels = it->second;
+
+    double r = gRandom->Rndm();
+    double cum = 0.0;
+    int chosen = -1;
+    for (size_t i = 0; i < channels.size(); ++i) {
+        cum += channels[i].br;
+        if (r <= cum) { chosen = i; break; }
+    }
+    if (chosen < 0) return;
+    const DecayChannel& ch = channels[chosen];
+
+    std::vector<double> dmass;
+    std::vector<int>    dPDG;
+    bool hasChargedPion = false;
+    for (const auto& dname : ch.daughters) {
+        auto it2 = nameToPDG.find(dname);
+        if (it2 == nameToPDG.end()) return;
+        int pdg = it2->second;
+        dPDG.push_back(pdg);
+        auto it3 = particleTable.find(std::abs(pdg));
+        if (it3 == particleTable.end()) return;
+        dmass.push_back(it3->second.mass);
+        if (std::abs(pdg) == 211) hasChargedPion = true;
+    }
+    if (!hasChargedPion) return;
+    if (dmass.size() < 2 || dmass.size() > 3) return;
+
+    double tau0 = lifetimeFromPDG(221);
+    double tau  = -tau0 * log(gRandom->Rndm());
+    double gamma = eta.E / eta.mass();
+    double dt = gamma * tau;
+
+    double dvx = eta.x + eta.betaX() * dt;
+    double dvy = eta.y + eta.betaY() * dt;
+    double dvz = eta.z + eta.betaZ() * dt;
+    double dvt = eta.t + dt;
+
+    std::vector<TLorentzVector> p4_rest;
+    double mEta = eta.mass();
+
+    if (dmass.size() == 2) {
+        double m1 = dmass[0], m2 = dmass[1];
+        double p_cm = sqrt((mEta*mEta - (m1+m2)*(m1+m2)) *
+                           (mEta*mEta - (m1-m2)*(m1-m2))) / (2.0 * mEta);
+        double cosTheta = 2.0 * gRandom->Rndm() - 1.0;
+        double sinTheta = sqrt(1.0 - cosTheta*cosTheta);
+        double phi = 2.0 * TMath::Pi() * gRandom->Rndm();
+        double e1 = sqrt(m1*m1 + p_cm*p_cm);
+        double e2 = sqrt(m2*m2 + p_cm*p_cm);
+        p4_rest.push_back(TLorentzVector(p_cm*sinTheta*cos(phi),
+                                         p_cm*sinTheta*sin(phi),
+                                         p_cm*cosTheta, e1));
+        p4_rest.push_back(TLorentzVector(-p_cm*sinTheta*cos(phi),
+                                         -p_cm*sinTheta*sin(phi),
+                                         -p_cm*cosTheta, e2));
+    } else if (dmass.size() == 3) {
+        Double_t masses[3] = {dmass[0], dmass[1], dmass[2]};
+        TGenPhaseSpace event3;
+        TLorentzVector parent4(0, 0, 0, mEta);
+        event3.SetDecay(parent4, 3, masses);
+        Double_t weight = event3.Generate();
+        (void)weight;
+        for (int i = 0; i < 3; ++i)
+            p4_rest.push_back(*event3.GetDecay(i));
+    }
+
+    if (p4_rest.size() != dmass.size()) return;
+
+    TVector3 betaVec(eta.px/eta.E, eta.py/eta.E, eta.pz/eta.E);
+    for (size_t i = 0; i < dmass.size(); ++i)
+        p4_rest[i].Boost(betaVec);
+
+    for (size_t i = 0; i < dmass.size(); ++i) {
+        Particle d;
+        d.event_id = event_id;
+        d.ensemble_id = eta.ensemble_id;
+        d.pid = dPDG[i];
+
+        if      (dPDG[i] ==  211) d.charge =  1;
+        else if (dPDG[i] == -211) d.charge = -1;
+        else if (dPDG[i] ==  111) d.charge =  0;
+        else if (dPDG[i] ==  321) d.charge =  1;
+        else if (dPDG[i] == -321) d.charge = -1;
+        else if (dPDG[i] ==  311 || dPDG[i] == 130 || dPDG[i] == 310) d.charge = 0;
+        else                      d.charge =  0;
+
+        d.ID = nextID++;
+        d.mom1 = 221;
+        d.mom2 = 0;
+
+        d.px = p4_rest[i].Px();
+        d.py = p4_rest[i].Py();
+        d.pz = p4_rest[i].Pz();
+        d.E  = p4_rest[i].E();
+
+        d.proc_type = eta.proc_type;
+        d.proc_id_origin = eta.proc_id_origin;
+        d.time_last_coll = eta.time_last_coll;
+
+        d.x = dvx; d.y = dvy; d.z = dvz; d.t = dvt;
+        d.xf = dvx; d.yf = dvy; d.zf = dvz; d.tf = dvt;
+
+        daughters.push_back(d);
+    }
+}
+
+// ---------------------------
+// Main Function
+// ---------------------------
+void auau3D()
+{
+    gStyle->SetOptStat(0);
+    gStyle->SetOptTitle(0);
+    TH1::AddDirectory(kFALSE);
+
+//const char* oscar_file = "/home/zeinab/Documents/vhlle-smash/hybrid/AuAu_RHIC200/smash.out/cent0_5/particle_lists.oscar";
+
+
+const char* oscar_file = "/home/zeinab/Documents/vhlle-smash/hybrid/AuAu_RHIC200/backup800200smashrunsoscars/particle_lists_merged_1000.oscar";
+
+
+    std::vector<std::string> fullHistoryFiles = {
+        "/home/zeinab/Documents/vhlle-smash/hybrid/AuAu_RHIC200/backup800200smashrunsoscars/200fullinfo/full_event_history200a.oscar"
+    };
+
+    LoadParticleTable("/home/zeinab/Documents/vhlle-smash/smash/input/particles.txt");
+    LoadDecayModes("/home/zeinab/Documents/vhlle-smash/smash/input/decaymodes.txt");
+
+    cout << "\n=== DEBUG ETA DECAYS ===" << endl;
+
+cout << "nameToPDG[eta] = "
+     << nameToPDG["eta"] << endl;
+
+cout << "decayTable has eta? "
+     << decayTable.count(221) << endl;
+
+if (decayTable.count(221)) {
+
+    cout << "N eta channels = "
+         << decayTable[221].size() << endl;
+
+    for (const auto& ch : decayTable[221]) {
+
+        cout << "BR = " << ch.br << " daughters: ";
+
+        for (auto& d : ch.daughters)
+            cout << d << " ";
+
+        cout << endl;
+    }
+}
+vector<Particle> particles = LoadOSCAR(oscar_file);
+
+std::map<ParticleKey, ProductionInfo> productionMap;
+for (const auto& histFile : fullHistoryFiles) {
+    LoadDecayVertices(histFile.c_str(), productionMap);
+}
+MatchHistoryVertices(particles, productionMap);
+
+std::map<int, const Particle*> particleByID;
+for (const auto& p : particles) {
+    particleByID[p.ID] = &p;
+}
+
+std::set<std::pair<int,int>> etaMatched;
+for (const auto& p : particles) {
+    if (std::abs(p.pid) == 211 && p.hasHistoryProductionVertex &&
+        std::abs(p.historyParentPDG) == 221) {
+        etaMatched.insert({p.event_id, p.historyParentID});
+    }
+}
+
+std::vector<Particle> eta_daughters;
+int nextID = particles.size() + 100000;
+int etasSkipped = 0, etasDecayed = 0;
+
+for (const auto& p : particles) {
+    if (std::abs(p.pid) == 221) {
+        if (etaMatched.count({p.event_id, p.ID})) {
+            etasSkipped++;
+            continue;
+        }
+        DecayEtaParticles(p, eta_daughters, nextID, p.event_id);
+        etasDecayed++;
+    }
+}
+
+std::cout << "Eta preprocessing: " << etasSkipped << " etas already covered by history, "
+          << etasDecayed << " decayed via fallback sampling\n";
+std::cout << "Created " << eta_daughters.size() << " eta daughter particles\n";
+
+size_t oldSize = particles.size();
+particles.insert(particles.end(), eta_daughters.begin(), eta_daughters.end());
+
+particles.reserve(particles.size());
+for (size_t i = oldSize; i < particles.size(); ++i) {
+    particleByID[particles[i].ID] = &particles[i];
+}
+
+int etaPions = 0;
+for (const auto& d : eta_daughters) {
+    if (std::abs(d.pid) == 211) etaPions++;
+}
+std::cout << "Generated " << etaPions << " charged pions from eta decays\n";
+
+for (auto& p : particles) {
+    int parentPDG = findOriginalParent(p, particleByID);
+    bool isHalo = (parentPDG != 0) && isHaloParent(parentPDG);
+    assignEmissionPoint(p, parentPDG, isHalo);
+}
+
+SourceStats stats = CountPionSources(particles, particleByID);
+PrintSourceStats(stats);
+
+vector<int> all_event_ids;
+set<int> seen;
+for (const auto& p : particles) {
+    if (seen.insert(p.event_id).second) {
+        all_event_ids.push_back(p.event_id);
+    }
+}
+int total_events = all_event_ids.size();
+
+cout << "Found " << total_events << " unique events in sample." << endl;
+
+myLevy_reader = new Levy_reader("levy_proj3D_values.dat");
+
+vector<double> kT_bins;
+double kT_min_val = 0.15;
+double kT_max_val = 0.85;
+double step = 0.05;
+for(double k = kT_min_val; k <= kT_max_val + 1e-6; k += step) {
+    kT_bins.push_back(k);
+}
+int nBins = kT_bins.size()-1;
+
+// ============================================================
+// ρ_max^λ cutoffs
+// ============================================================
+vector<pair<string, double>> rhoLambdaCutoffs = {
+    {"1mm",   1.0e12},
+    {"5mm",   5.0e12},
+    {"5cm",   5.0e13},
+    {"50cm",  5.0e14}
+};
+
+// Storage: fit parameters 
+vector<double> mt_vals, mt_err;
+vector<double> alpha_vals, alpha_err;
+vector<double> Rout_vals, Rout_err;
+vector<double> Rside_vals, Rside_err;
+vector<double> Rlong_vals, Rlong_err;
+vector<double> chi2_vals, ndf_vals, CL_vals;
+vector<int> success_vals;
+
+// Storage: λ per cutoff
+map<string, vector<double>> lambda_by_cutoff;
+map<string, vector<double>> lambda_err_by_cutoff;
+for (auto& lc : rhoLambdaCutoffs) {
+    lambda_by_cutoff[lc.first] = {};
+    lambda_err_by_cutoff[lc.first] = {};
+}
+
+// --- Loop over kT bins ---
+for(int ibin = 0; ibin < nBins; ibin++) {
+    double kT_min = kT_bins[ibin];
+    double kT_max = kT_bins[ibin+1];
+    cout << "\n=== kT bin: " << kT_min << " - " << kT_max << " ===" << endl;
+
+    HBTResults res = AnalyzePairs(particles, particleByID, kT_min, kT_max, false);
+    if (res.total_pairs < 10) continue;
+
+    const double fit_min = 0.1;
+    double kT_mean = 0.5*(kT_min+kT_max);
+    const double m_pi = 0.13957;
+    double mT = sqrt(kT_mean*kT_mean + m_pi*m_pi);
+    double fit_max = sqrt(2500.0/mT);
+    double fit_max_x[3] = {fit_max, fit_max, fit_max};
+
+    const int NPAR = 5;
+
+    // ================================================================
+    // LogLikelihood: integral up to rho_lambda_max
+    // ================================================================
+    struct LogLikelihood {
+        HBTResults res;
+        double fit_min, fit_max_x[3];
+        double rho_lambda_max;
+        int* pBinsUsed;
+
+        LogLikelihood(const HBTResults& r, double min, const double max_vals[3],
+                      double rhoLamMax, int* binPtr)
+            : res(r), fit_min(min), rho_lambda_max(rhoLamMax), pBinsUsed(binPtr) {
+            for(int i=0; i<3; i++) fit_max_x[i] = max_vals[i];
+        }
+
+        double operator()(const double* p) const {
+            double logL = 0.0;
+            int currentBins = 0;
+            TH1F* hists[3] = {res.hOut, res.hSide, res.hLong};
+
+            for(int i=0; i<3; i++) {
+                double pars[3] = {p[0], p[i+1], p[4]};
+
+                // Integral up to rho_lambda_max
+                int lastBin = hists[i]->FindBin(rho_lambda_max);
+                double integral = hists[i]->Integral(0, lastBin);
+                if (integral <= 0) continue;
+
+                for(int b = 1; b <= hists[i]->GetNbinsX(); b++) {
+                    double x = hists[i]->GetBinCenter(b);
+                    if (x < fit_min || x > fit_max_x[i]) continue;
+
+                    double observed = hists[i]->GetBinContent(b);
+                    double expected = LevyProj1DFunc(&x, pars)
+                                     * hists[i]->GetBinWidth(b) * integral;
+                    if (expected <= 1e-12) expected = 1e-12;
+
+                    if (observed > 0) {
+                        logL += expected - observed + observed * std::log(observed/expected);
+                    } else {
+                        logL += expected;
+                    }
+                    currentBins++;
+                }
+            }
+            if (pBinsUsed) *pBinsUsed = currentBins;
+            return logL;
+        }
+    };
+
+    // Store shape parameters once per kT bin (1mm cutoff only)
+    bool shapeStored = false;
+
+    for (auto& lc : rhoLambdaCutoffs) {
+        const string& label = lc.first;
+        double rhoLamMax = lc.second;
+
+        int actualBins = 0;
+        LogLikelihood loglikfunc(res, fit_min, fit_max_x, rhoLamMax, &actualBins);
+        ROOT::Math::Functor f(loglikfunc, NPAR);
+
+        ROOT::Math::Minimizer* minimizer =
+            ROOT::Math::Factory::CreateMinimizer("Minuit2", "Migrad");
+
+        minimizer->SetFunction(f);
+        minimizer->SetMaxFunctionCalls(50000);
+        minimizer->SetMaxIterations(50000);
+        minimizer->SetTolerance(1e-4);
+        minimizer->SetStrategy(2);
+
+
+        minimizer->SetLimitedVariable(0, "alpha",  1.2, 0.01, 0.5, 2.5);
+        minimizer->SetLimitedVariable(1, "Rout",   6.0, 0.1,  2.0, 20.0);
+        minimizer->SetLimitedVariable(2, "Rside",  4.0, 0.1,  2.0, 20.0);
+        minimizer->SetLimitedVariable(3, "Rlong",  5.0, 0.1,  2.0, 20.0);
+        minimizer->SetLimitedVariable(4, "lambda", 0.9, 0.01, 0.05, 1.5);
+
+        minimizer->Minimize();
+
+        const double* p = minimizer->X();
+        const double* err = minimizer->Errors();
+        double chi2 = minimizer->MinValue();
+        int ndf = actualBins - NPAR;
+        double CL = (ndf > 0) ? TMath::Prob(chi2, ndf) : 0;
+        int status = minimizer->Status();
+
+        // Store shape parameters only once
+        if (!shapeStored) {
+            mt_vals.push_back(mT); mt_err.push_back(0.0);
+            alpha_vals.push_back(p[0]); alpha_err.push_back(err[0]);
+            Rout_vals.push_back(p[1]);  Rout_err.push_back(err[1]);
+            Rside_vals.push_back(p[2]); Rside_err.push_back(err[2]);
+            Rlong_vals.push_back(p[3]); Rlong_err.push_back(err[3]);
+            chi2_vals.push_back(chi2);
+            ndf_vals.push_back(ndf);
+            CL_vals.push_back(CL);
+            success_vals.push_back(status);
+            shapeStored = true;
+        }
+
+        // Store lambda for 1mm cutoff
+        lambda_by_cutoff[label].push_back(p[4]);
+        lambda_err_by_cutoff[label].push_back(err[4]);
+
+        if (label == "1mm") {
+            cout << "  " << label << ": lambda = " << p[4] << " +/- " << err[4] << endl;
+            cout << "  alpha = " << p[0] << " Rout = " << p[1] << " Rside = " << p[2] << " Rlong = " << p[3] << endl;
+            cout << "  -logL/NDF = " << chi2 << "/" << ndf << " (CL = " << CL*100 << "%)" << endl;
+        }
+
+        delete minimizer;
+    }
+
+    // --- Plot using the 1mm fit result ---
+  
+    if (shapeStored) {
+        int idx = mt_vals.size() - 1;
+        double alpha = alpha_vals[idx];
+        double Rout = Rout_vals[idx];
+        double Rside = Rside_vals[idx];
+        double Rlong = Rlong_vals[idx];
+        double lam = lambda_by_cutoff["1mm"].back();  
+        double lam_err = lambda_err_by_cutoff["1mm"].back();
+
+        // --- Draw D(rho) with fit  ---
+        TCanvas* c = new TCanvas(Form("c_%d", ibin),
+                                 Form("kT: %.2f-%.2f GeV/c, N_{pairs} = %d",
+                                      kT_min, kT_max, res.total_pairs),
+                                 1800, 600);
+        c->Divide(3,1);
+
+        TH1F* hdir[3] = {res.hOut, res.hSide, res.hLong};
+        const char* names[3] = {"out", "side", "long"};
+
+        for (int idir = 0; idir < 3; ++idir) {
+            c->cd(idir+1);
+            gPad->SetLogx();
+            gPad->SetLogy();
+
+            TH1F* h = hdir[idir];
+            double norm = h->Integral(1, h->GetNbinsX());
+            if(norm>0) h->Scale(1.0/norm,"width");
+
+            double xmin[3] = {0.1 , 0.1, 0.1};
+            double xmax[3] = {1e15 , 1e15, 1e15};
+            h->GetXaxis()->SetRangeUser(xmin[idir], xmax[idir]);
+            h->SetMinimum(1e-25);
+            h->SetMaximum(1.0);
+            h->SetMarkerStyle(20);
+            h->SetMarkerSize(0.8);
+
+            h->GetYaxis()->SetTitle("D(#rho)");
+            res.hOut->GetXaxis()->SetTitle("#rho_{out} [fm]");
+            res.hSide->GetXaxis()->SetTitle("#rho_{side} [fm]");
+            res.hLong->GetXaxis()->SetTitle("#rho_{long} [fm]");
+
+            h->Draw("E");
+
+            double R_par[3] = {Rout, Rside, Rlong};
+            double par[3] = {alpha, R_par[idir], lam};
+
+            TF1* flevy = new TF1(Form("f_%s_%d", names[idir], ibin),
+                                 LevyProj1DFunc, xmin[idir], xmax[idir], 3);
+            flevy->SetParameters(par);
+            flevy->SetLineColor(kRed);
+            flevy->SetLineWidth(3);
+            flevy->Draw("SAME");
+
+            double ymin = h->GetMinimum();
+            if(ymin<=0) ymin = 1e-25;
+            double ymax = h->GetMaximum();
+
+            TLine *fitLine = new TLine(fit_max, ymin, fit_max, ymax);
+            fitLine->SetLineStyle(2);
+            fitLine->SetLineColor(kBlue+2);
+            fitLine->SetLineWidth(2);
+            fitLine->Draw("SAME");
+
+            TPaveText* box = new TPaveText(0.35, 0.15, 0.65, 0.40, "NDC");
+            box->SetFillStyle(0);
+            box->SetBorderSize(0);
+            box->SetTextSize(0.035);
+            box->SetTextAlign(22);
+
+            box->AddText(Form("#alpha = %.3f #pm %.3f", alpha, alpha_err[idx]));
+            box->AddText(Form("R_{%s} = %.2f #pm %.2f fm", names[idir], R_par[idir],
+                              (idir==0 ? Rout_err[idx] : (idir==1 ? Rside_err[idx] : Rlong_err[idx]))));
+            box->AddText(Form("#lambda_{1mm} = %.2f #pm %.2f", lam, lam_err));
+            box->AddText(Form("#chi^{2}/NDF = %.2f / %d", chi2_vals[idx], (int)ndf_vals[idx]));
+            box->AddText(Form("#rho_{max}=%.1f fm",fit_max));
+            box->Draw();
+        }
+
+        c->cd(1);
+        TPaveText* info = new TPaveText(0.65, 0.80, 0.95, 0.95, "NDC");
+        info->SetFillStyle(0);
+        info->SetBorderSize(0);
+        info->SetTextSize(0.04);
+        info->SetTextAlign(32);
+        info->AddText(Form("kT: %.2f-%.2f GeV/c", kT_min, kT_max));
+        info->AddText(Form("N_{pairs} = %d", res.total_pairs));
+        info->Draw();
+        c->SaveAs(Form("kT_%.2f-%.2f.png", kT_min, kT_max));
+
+        delete c;
+    }
+}
+
+// --- Summary canvas: mT dependence ---
+TCanvas *c_mT = new TCanvas("c_mT", "Fit Parameters vs m_T", 1600, 1200);
+c_mT->Divide(2, 2);
+
+int nPoints = mt_vals.size();
+
+// Pad 1: alpha
+c_mT->cd(1);
+TGraphErrors *gAlpha = new TGraphErrors(nPoints,
+    &mt_vals[0], &alpha_vals[0],
+    &mt_err[0],  &alpha_err[0]);
+gAlpha->SetTitle("#alpha vs m_{T}; m_{T} [GeV]; #alpha");
+gAlpha->SetMarkerStyle(20);
+gAlpha->SetMarkerColor(kBlack);
+gAlpha->GetHistogram()->GetYaxis()->SetRangeUser(0.5, 2.0);
+gAlpha->Draw("AP");
+
+// Pad 2: Radii
+c_mT->cd(2);
+TGraphErrors *gRout = new TGraphErrors(nPoints,
+    &mt_vals[0], &Rout_vals[0],
+    &mt_err[0],  &Rout_err[0]);
+gRout->SetMarkerStyle(21);
+gRout->SetMarkerColor(kRed);
+gRout->SetLineColor(kRed);
+gRout->SetTitle("HBT radii vs m_{T}; m_{T} [GeV]; R [fm]");
+
+TGraphErrors *gRside = new TGraphErrors(nPoints,
+    &mt_vals[0], &Rside_vals[0],
+    &mt_err[0],  &Rside_err[0]);
+gRside->SetMarkerStyle(22);
+gRside->SetMarkerColor(kBlue);
+gRside->SetLineColor(kBlue);
+
+TGraphErrors *gRlong = new TGraphErrors(nPoints,
+    &mt_vals[0], &Rlong_vals[0],
+    &mt_err[0],  &Rlong_err[0]);
+gRlong->SetMarkerStyle(23);
+gRlong->SetMarkerColor(kGreen+2);
+gRlong->SetLineColor(kGreen+2);
+
+gRout->GetHistogram()->GetYaxis()->SetRangeUser(0.5, 35.0);
+gRout->Draw("AP");
+gRside->Draw("P SAME");
+gRlong->Draw("P SAME");
+
+TLegend *legRadii = new TLegend(0.65, 0.70, 0.88, 0.88);
+legRadii->SetBorderSize(0);
+legRadii->SetFillStyle(0);
+legRadii->AddEntry(gRout, "R_{out}", "P");
+legRadii->AddEntry(gRside, "R_{side}", "P");
+legRadii->AddEntry(gRlong, "R_{long}", "P");
+legRadii->Draw();
+
+// Pad 3: lambda – using 1mm cutoff
+c_mT->cd(3);
+const auto& lam1mm = lambda_by_cutoff["1mm"];
+const auto& lam1mmErr = lambda_err_by_cutoff["1mm"];
+if (lam1mm.size() == nPoints) {
+    TGraphErrors *gLambda = new TGraphErrors(nPoints,
+        &mt_vals[0], &lam1mm[0],
+        &mt_err[0],  &lam1mmErr[0]);
+    gLambda->SetTitle("#lambda_{1mm} vs m_{T}; m_{T} [GeV/c^2]; #lambda");
+    gLambda->SetMarkerStyle(20);
+    gLambda->SetMarkerColor(kBlack);
+    gLambda->GetYaxis()->SetRangeUser(0.0, 1.1);
+    gLambda->Draw("AP");
+} else {
+    TPaveText* warn = new TPaveText(0.15, 0.45, 0.85, 0.60, "NDC");
+    warn->SetBorderSize(0);
+    warn->SetFillStyle(0);
+    warn->AddText("Incomplete #lambda results for 1mm");
+    warn->Draw();
+}
+
+// Pad 4: system information
+c_mT->cd(4);
+gPad->SetFillColor(0);
+gPad->SetFrameBorderMode(0);
+
+TPaveText *sysInfo = new TPaveText(0.10, 0.10, 0.90, 0.90, "NDC");
+sysInfo->SetTextSize(0.045);
+sysInfo->SetFillColor(0);
+sysInfo->SetBorderSize(1);
+sysInfo->SetTextFont(42);
+sysInfo->SetTextAlign(12);
+
+sysInfo->AddText("System Information");
+sysInfo->AddText("---------------------------");
+sysInfo->AddText(Form("%s", collision_system));
+sysInfo->AddText(Form("#sqrt{s_{NN}} = %.0f GeV", sqrt_sNN));
+sysInfo->AddText(Form("Centrality: %s", centrality));
+sysInfo->AddText(" ");
+sysInfo->AddText("Kinematic cuts:");
+sysInfo->AddText(Form("%.2f < p_{T} < %.2f GeV/c", pT_min, pT_max));
+sysInfo->AddText(Form("|#eta| < %.1f", eta_cut));
+sysInfo->Draw();
+
+c_mT->SaveAs("Proj3D_FitParameters_vs_mT.png");
+c_mT->Write();
+
+// --- CSV: fit parameters + lambda per cutoff ---
+std::ofstream csv("Levy_fit_parameters_vs_kT.csv");
+csv << std::setprecision(10);
+csv << "kT_min,kT_max,kT_mean,mT,"
+    << "alpha,alpha_err,Rout,Rout_err,Rside,Rside_err,Rlong,Rlong_err,"
+    << "chi2_ndf,ndf,CL,status";
+for (auto& lc : rhoLambdaCutoffs) {
+    csv << "," << lc.first << "_lambda," << lc.first << "_lambda_err";
+}
+csv << "\n";
+
+for (int i = 0; i < nPoints; ++i) {
+    double kT_min = kT_bins[i];
+    double kT_max = kT_bins[i+1];
+    double kT_mean = 0.5*(kT_min + kT_max);
+    csv << kT_min << "," << kT_max << "," << kT_mean << "," << mt_vals[i] << ","
+        << alpha_vals[i] << "," << alpha_err[i] << ","
+        << Rout_vals[i] << "," << Rout_err[i] << ","
+        << Rside_vals[i] << "," << Rside_err[i] << ","
+        << Rlong_vals[i] << "," << Rlong_err[i] << ","
+        << chi2_vals[i] << "," << ndf_vals[i] << "," << CL_vals[i] << ","
+        << success_vals[i];
+    for (auto& lc : rhoLambdaCutoffs) {
+        const string& label = lc.first;
+        csv << "," << lambda_by_cutoff[label][i] << "," << lambda_err_by_cutoff[label][i];
+    }
+    csv << "\n";
+}
+csv.close();
+std::cout << "Fit parameters written to Levy_fit_parameters_vs_kT.csv\n";
+}
