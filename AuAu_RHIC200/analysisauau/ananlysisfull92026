@@ -488,15 +488,24 @@ HBTResults AnalyzePairs(const std::vector<Particle>& particles,
         events[p.event_id].push_back(p);
     }
 
-    const int n_bins = 300;
-    double rho_min = 0.1;
-    double rho_max = 1e15;
-    double bins[n_bins + 1];
+   const int n_bins = 300;
 
-    double r = pow(rho_max / rho_min, 1.0 / n_bins);
-    bins[0] = rho_min;
-    for (int i = 1; i <= n_bins; i++) bins[i] = bins[i - 1] * r;
+const double rho_min = 0.1;
 
+// The histogram must contain the complete source and all
+// normalization cutoffs, including 50 cm.
+const double rho_max = 1.0e15;
+
+double bins[n_bins + 1];
+
+const double logStep =
+    std::pow(rho_max / rho_min, 1.0 / n_bins);
+
+bins[0] = rho_min;
+
+for (int i = 1; i <= n_bins; ++i) {
+    bins[i] = bins[i - 1] * logStep;
+}
     TH1F* hRho  = new TH1F("hRho",  "D(#rho)", n_bins, bins);
     TH1F* hOut  = new TH1F("hOut",  "", n_bins, bins);
     TH1F* hSide = new TH1F("hSide", "", n_bins, bins);
@@ -636,6 +645,50 @@ std::unordered_map<int, std::vector<DecayChannel>> decayTable;
 std::unordered_map<int, ParticleInfo> particleTable;
 std::unordered_map<std::string, int> nameToPDG;
 
+
+// ============================================================
+// Global map: parent PDG -> median simulated emission radius
+// (filled after the emission-point assignment loop)
+// ============================================================
+std::map<int, double> gParentMedianEmission;
+
+// ============================================================
+// Compute, for each parent species, the median emission radius
+// of its charged-pion daughters (|xf, yf, zf| from the simulation)
+// ============================================================
+void ComputeParentMedianEmission(const std::vector<Particle>& particles)
+{
+    std::map<int, std::vector<double>> buckets;
+
+    for (const auto& p : particles) {
+        if (std::abs(p.pid) != 211) continue;
+
+        int pdg = 0;
+        if (p.historyParentPDG != 0)   pdg = std::abs(p.historyParentPDG);
+        else if (p.mom1 != 0)          pdg = std::abs(p.mom1);
+        else if (p.mom2 != 0)          pdg = std::abs(p.mom2);
+        if (pdg == 0) continue;
+
+        // Only consider "halo-like" parents, i.e. those with
+        // a finite lifetime used in the fallback
+        if (!isHaloParent(pdg)) continue;
+
+        double r = std::sqrt(p.xf*p.xf + p.yf*p.yf + p.zf*p.zf);
+        if (r > 1.0) buckets[pdg].push_back(r);   // skip numerical zeros
+    }
+
+    gParentMedianEmission.clear();
+    for (auto& kv : buckets) {
+        auto& v = kv.second;
+        std::sort(v.begin(), v.end());
+        // geometric-like median (works with the log axis display)
+        double med = v[v.size() / 2];
+        gParentMedianEmission[kv.first] = med;
+        std::cout << "  median emission radius for PDG " << kv.first
+                  << " = " << med << " fm  (N = " << v.size() << ")\n";
+    }
+}
+
 void LoadParticleTable(const std::string& filename)
 {
     std::ifstream fin(filename);
@@ -772,7 +825,7 @@ constexpr double hbarc = 0.1973269804; // GeV fm
 TRandom3 rng(0);
 
 double properLifetimeFmC(double widthGeV) {
-    if (widthGeV <= 0.0) return 1e30;
+    if (widthGeV <= 0.0) return 1e25;
     return hbarc / widthGeV;
 }
 
@@ -788,18 +841,9 @@ double lifetimeFromPDG(int pdg) {
 }
 
 void assignEmissionPoint(Particle& p, int parentPDG, bool halo) {
-
-    if (p.hasHistoryProductionVertex) {
-        p.xf = p.productionX;
-        p.yf = p.productionY;
-        p.zf = p.productionZ;
-        p.tf = p.productionT;
-        return;
-    }
-
     if (halo) {
         double tau0 = lifetimeFromPDG(parentPDG);
-        if (tau0 <= 0.0) tau0 = 1e30;
+        if (tau0 <= 0.0) tau0 = 1e20;
 
         double tauProper = sampleDecayProperTime(tau0);
         double gamma = p.E / p.mass();
@@ -928,10 +972,51 @@ void DecayEtaParticles(const Particle& eta,
         d.x = dvx; d.y = dvy; d.z = dvz; d.t = dvt;
         d.xf = dvx; d.yf = dvy; d.zf = dvz; d.tf = dvt;
 
-        daughters.push_back(d);
+          daughters.push_back(d);
     }
 }
 
+// ============================================================
+// Approximate lab-frame emission length for a given parent PDG
+// gamma * c*tau = (E/m) * (hbar*c / Gamma)
+// 'gammaAssumed' is the typical boost factor of the parent in
+// the fireball; use 2.0 for a first-order estimate.
+// ============================================================
+double TypicalEmissionLength(int pdg, double gammaAssumed = 2.0)
+{
+    pdg = std::abs(pdg);
+    auto it = particleTable.find(pdg);
+    if (it == particleTable.end()) return 0.0;
+
+    double width = it->second.width;         // GeV
+    if (width <= 0.0) return 0.0;
+
+    double ctau = hbarc / width;             // fm
+    return gammaAssumed * ctau;              // fm
+}
+
+int CountFitBins(
+    TH1* h,
+    double fitMin,
+    double fitMax)
+{
+    int count = 0;
+
+    for (int b = 1;
+         b <= h->GetNbinsX();
+         ++b) {
+
+        const double x =
+            h->GetBinCenter(b);
+
+        if (x >= fitMin &&
+            x <= fitMax) {
+            ++count;
+        }
+    }
+
+    return count;
+}
 // ---------------------------
 // Main Function
 // ---------------------------
@@ -947,11 +1032,11 @@ void auau3D()
 //const char* oscar_file = "/home/zeinab/Documents/vhlle-smash/hybrid/AuAu_RHIC200/backup800200smashrunsoscars/particle_lists800.oscar";
 
 
-const char* oscar_file = "/home/zeinab/Documents/vhlle-smash/hybrid/AuAu_RHIC200/backup800200smashrunsoscars/particle_lists_merged_1000.oscar";
+const char* oscar_file = "/home/zeinab/Documents/vhlle-smash/hybrid/AuAu_RHIC200/backup800200smashrunsoscars/200fullinfo/particle_listspar_1000events.oscar";
 
 
     std::vector<std::string> fullHistoryFiles = {
-        "/home/zeinab/Documents/vhlle-smash/hybrid/AuAu_RHIC200/backup800200smashrunsoscars/200fullinfo/full_event_history800events.oscar"
+        "/home/zeinab/Documents/vhlle-smash/hybrid/AuAu_RHIC200/backup800200smashrunsoscars/200fullinfo/full_event_history_1000events.oscar"
     };
 
     LoadParticleTable("/home/zeinab/Documents/vhlle-smash/smash/input/particles.txt");
@@ -1040,6 +1125,10 @@ for (auto& p : particles) {
     assignEmissionPoint(p, parentPDG, isHalo);
 }
 
+    // ** NEW: compute the simulated emission radius per parent species **
+    std::cout << "\n=== Simulated parent emission radii ===\n";
+    ComputeParentMedianEmission(particles);
+    
 SourceStats stats = CountPionSources(particles, particleByID);
 PrintSourceStats(stats);
 
@@ -1126,37 +1215,88 @@ for(int ibin = 0; ibin < nBins; ibin++) {
         }
 
         double operator()(const double* p) const {
-            double logL = 0.0;
+            double deviance = 0.0;
             int currentBins = 0;
             TH1F* hists[3] = {res.hOut, res.hSide, res.hLong};
 
             for(int i=0; i<3; i++) {
                 double pars[3] = {p[0], p[i+1], p[4]};
 
-                // Integral up to rho_lambda_max
+                // =====================================================
+                // FIX: normalization from bin 1 (not bin 0),
+                //      up to rho_lambda_max (1 mm for the "1mm" cutoff).
+                //      This makes the fitted lambda the physical
+                //      core fraction relative to the full source.
+                // =====================================================
                 int lastBin = hists[i]->FindBin(rho_lambda_max);
-                double integral = hists[i]->Integral(0, lastBin);
-                if (integral <= 0) continue;
+                if (lastBin > hists[i]->GetNbinsX())
+                    lastBin = hists[i]->GetNbinsX();
 
-                for(int b = 1; b <= hists[i]->GetNbinsX(); b++) {
-                    double x = hists[i]->GetBinCenter(b);
-                    if (x < fit_min || x > fit_max_x[i]) continue;
+                double integral = hists[i]->Integral(1, lastBin);
+                if (integral <= 0) continue;
+                
+                const int firstPhysicalBin = 1;
+
+int lastLambdaBin =
+    hists[i]->FindBin(rho_lambda_max);
+
+if (lastLambdaBin >
+    hists[i]->GetNbinsX()) {
+    lastLambdaBin =
+        hists[i]->GetNbinsX();
+}
+
+const double normalizationCount =
+    hists[i]->Integral(
+        firstPhysicalBin,
+        lastLambdaBin
+    );
+
+if (!(normalizationCount > 0.0))
+    return 1.0e100;
+
+const int firstFitBin =
+    hists[i]->FindBin(fit_min);
+
+for (int b = firstFitBin;
+     b <= hists[i]->GetNbinsX();
+     ++b) {
+
+    const double x =
+        hists[i]->GetBinCenter(b);
+
+    if (x < fit_min ||
+        x > fit_max_x[i]) {
+        continue;
+    }
+
 
                     double observed = hists[i]->GetBinContent(b);
                     double expected = LevyProj1DFunc(&x, pars)
                                      * hists[i]->GetBinWidth(b) * integral;
                     if (expected <= 1e-12) expected = 1e-12;
 
-                    if (observed > 0) {
-                        logL += expected - observed + observed * std::log(observed/expected);
-                    } else {
-                        logL += expected;
-                    }
+                    if (observed > 0.0) {
+
+    deviance +=
+        2.0 * (
+            expected
+            - observed
+            + observed *
+              std::log(observed / expected)
+        );
+
+} else {
+
+    deviance +=
+        2.0 * expected;
+}
+
                     currentBins++;
                 }
             }
             if (pBinsUsed) *pBinsUsed = currentBins;
-            return logL;
+            return deviance;
         }
     };
 
@@ -1167,7 +1307,14 @@ for(int ibin = 0; ibin < nBins; ibin++) {
         const string& label = lc.first;
         double rhoLamMax = lc.second;
 
-        int actualBins = 0;
+
+
+int actualBins =
+    CountFitBins(res.hOut,  fit_min, fit_max)
+    + CountFitBins(res.hSide, fit_min, fit_max)
+    + CountFitBins(res.hLong, fit_min, fit_max);
+
+
         LogLikelihood loglikfunc(res, fit_min, fit_max_x, rhoLamMax, &actualBins);
         ROOT::Math::Functor f(loglikfunc, NPAR);
 
@@ -1185,12 +1332,28 @@ for(int ibin = 0; ibin < nBins; ibin++) {
         minimizer->SetLimitedVariable(1, "Rout",   6.0, 0.1,  2.0, 20.0);
         minimizer->SetLimitedVariable(2, "Rside",  4.0, 0.1,  2.0, 20.0);
         minimizer->SetLimitedVariable(3, "Rlong",  5.0, 0.1,  2.0, 20.0);
-        minimizer->SetLimitedVariable(4, "lambda", 0.9, 0.01, 0.05, 1.5);
+        minimizer->SetLimitedVariable(
+    4,
+    "lambda",
+    0.85,
+    0.01,
+    0.0,
+    1.2
+);
 
-        minimizer->Minimize();
+minimizer->SetErrorDef(1.0);
 
-        const double* p = minimizer->X();
-        const double* err = minimizer->Errors();
+const bool fitOK =
+    minimizer->Minimize();
+
+minimizer->Hesse();
+
+const double* p =
+    minimizer->X();
+
+const double* err =
+    minimizer->Errors();
+
         double chi2 = minimizer->MinValue();
         int ndf = actualBins - NPAR;
         double CL = (ndf > 0) ? TMath::Prob(chi2, ndf) : 0;
@@ -1217,7 +1380,8 @@ for(int ibin = 0; ibin < nBins; ibin++) {
         if (label == "1mm") {
             cout << "  " << label << ": lambda = " << p[4] << " +/- " << err[4] << endl;
             cout << "  alpha = " << p[0] << " Rout = " << p[1] << " Rside = " << p[2] << " Rlong = " << p[3] << endl;
-            cout << "  -logL/NDF = " << chi2 << "/" << ndf << " (CL = " << CL*100 << "%)" << endl;
+            cout << "  Poisson deviance/NDF = " << chi2 << "/" << ndf << " (CL = " << CL*100 << "%)" << endl;
+
         }
 
         delete minimizer;
@@ -1252,42 +1416,101 @@ for(int ibin = 0; ibin < nBins; ibin++) {
             TH1F* h = hdir[idir];
             double norm = h->Integral(1, h->GetNbinsX());
             if(norm>0) h->Scale(1.0/norm,"width");
-
-            double xmin[3] = {0.1 , 0.1, 0.1};
-            double xmax[3] = {1e15 , 1e15, 1e15};
-            h->GetXaxis()->SetRangeUser(xmin[idir], xmax[idir]);
+                const double rho_min = 0.1;
+                const double rho_max = 1.0e15;
+            const double displayMax = 1.0e15;
+h->GetXaxis()->SetRangeUser(
+    rho_min,
+    displayMax
+);
             h->SetMinimum(1e-25);
             h->SetMaximum(1.0);
             h->SetMarkerStyle(20);
             h->SetMarkerSize(0.8);
 
-            h->GetYaxis()->SetTitle("D(#rho)");
+h->GetYaxis()->SetNdivisions(505);      // fewer major divisions -> less crowding
+h->GetYaxis()->SetLabelSize(0.045);
+h->GetYaxis()->SetLabelOffset(0.01);
+h->GetYaxis()->SetMoreLogLabels(false); // don't force extra decade labels beyond ROOT's default spacing
+h->GetYaxis()->SetTitleSize(0);         // suppress any residual per-axis title
+h->GetYaxis()->SetTitleOffset(0);
+
+            //h->GetYaxis()->SetTitle("D(#rho)");
             res.hOut->GetXaxis()->SetTitle("#rho_{out} [fm]");
             res.hSide->GetXaxis()->SetTitle("#rho_{side} [fm]");
             res.hLong->GetXaxis()->SetTitle("#rho_{long} [fm]");
 
+            
             h->Draw("E");
 
+                         
             double R_par[3] = {Rout, Rside, Rlong};
             double par[3] = {alpha, R_par[idir], lam};
 
-            TF1* flevy = new TF1(Form("f_%s_%d", names[idir], ibin),
-                                 LevyProj1DFunc, xmin[idir], xmax[idir], 3);
-            flevy->SetParameters(par);
-            flevy->SetLineColor(kRed);
-            flevy->SetLineWidth(3);
-            flevy->Draw("SAME");
+            // Solid red: fitted core range only
+            TF1* flevyFit = new TF1(Form("fFit_%s_%d", names[idir], ibin),
+                                    LevyProj1DFunc,
+                                    fit_min, fit_max, 3);
+            flevyFit->SetParameters(par);
+            flevyFit->SetLineColor(kRed);
+            flevyFit->SetLineStyle(1);      // solid
+            flevyFit->SetLineWidth(3);
+            flevyFit->Draw("SAME");
+
+            // Dashed red: extrapolation beyond the core fit range
+            TF1* flevyTail = new TF1(Form("fTail_%s_%d", names[idir], ibin),
+                                     LevyProj1DFunc,
+                                     fit_max, displayMax, 3);
+            flevyTail->SetParameters(par);
+            flevyTail->SetLineColor(kRed);
+            flevyTail->SetLineStyle(2);     // dashed
+            flevyTail->SetLineWidth(3);
+            flevyTail->Draw("SAME");
 
             double ymin = h->GetMinimum();
             if(ymin<=0) ymin = 1e-25;
             double ymax = h->GetMaximum();
 
-            TLine *fitLine = new TLine(fit_max, ymin, fit_max, ymax);
-            fitLine->SetLineStyle(2);
-            fitLine->SetLineColor(kBlue+2);
-            fitLine->SetLineWidth(2);
-            fitLine->Draw("SAME");
+           
+// Lines: drawn on every panel (out, side, long)
+TLine *fitRangeLine = new TLine(fit_max, ymin, fit_max, ymax);
+fitRangeLine->SetLineStyle(2);
+fitRangeLine->SetLineColor(kBlack);
+fitRangeLine->SetLineWidth(1);
+fitRangeLine->Draw("SAME");
 
+const double lambda1mmCutoff = 1.0e12; // fm
+
+TLine *lambdaCutoffLine = new TLine(lambda1mmCutoff, ymin, lambda1mmCutoff, ymax);
+lambdaCutoffLine->SetLineStyle(2);
+lambdaCutoffLine->SetLineColor(kBlack);
+lambdaCutoffLine->SetLineWidth(1);
+lambdaCutoffLine->Draw("SAME");
+
+// Text labels: only on the middle ("side") panel
+if (idir == 1) {
+    gPad->Update();
+    double xNdcFit    = (log10(fit_max)         - log10(rho_min)) / (log10(displayMax) - log10(rho_min));
+    double xNdcLambda = (log10(lambda1mmCutoff) - log10(rho_min)) / (log10(displayMax) - log10(rho_min));
+
+    double leftM  = gPad->GetLeftMargin();
+    double rightM = gPad->GetRightMargin();
+    xNdcFit    = leftM + xNdcFit    * (1.0 - leftM - rightM);
+    xNdcLambda = leftM + xNdcLambda * (1.0 - leftM - rightM);
+
+    TLatex latexFit;
+    latexFit.SetNDC();
+    latexFit.SetTextSize(0.045);
+    latexFit.SetTextAlign(21);
+    latexFit.DrawLatex(xNdcFit, 0.93, "#rho_{max}^{fit}");
+
+    TLatex latexLambda;
+    latexLambda.SetNDC();
+    latexLambda.SetTextSize(0.045);
+    latexLambda.SetTextAlign(21);
+    latexLambda.DrawLatex(xNdcLambda, 0.93, "#rho_{max}^{#lambda}");
+}
+            
             TPaveText* box = new TPaveText(0.35, 0.15, 0.65, 0.40, "NDC");
             box->SetFillStyle(0);
             box->SetBorderSize(0);
@@ -1298,12 +1521,18 @@ for(int ibin = 0; ibin < nBins; ibin++) {
             box->AddText(Form("R_{%s} = %.2f #pm %.2f fm", names[idir], R_par[idir],
                               (idir==0 ? Rout_err[idx] : (idir==1 ? Rside_err[idx] : Rlong_err[idx]))));
             box->AddText(Form("#lambda_{1mm} = %.2f #pm %.2f", lam, lam_err));
-            box->AddText(Form("#chi^{2}/NDF = %.2f / %d", chi2_vals[idx], (int)ndf_vals[idx]));
-            box->AddText(Form("#rho_{max}=%.1f fm",fit_max));
+            box->AddText(Form("-logL/NDF = %.2f / %d", chi2_vals[idx], (int)ndf_vals[idx]));
+            box->AddText(Form("#rho_{max}^{fit}=%.1f fm",fit_max));
             box->Draw();
+            
         }
 
         c->cd(1);
+TLatex yTitle;
+yTitle.SetNDC();
+yTitle.SetTextSize(0.05);
+yTitle.SetTextFont(42);
+yTitle.DrawLatex(0.02, 0.94, "D(#rho)");
         TPaveText* info = new TPaveText(0.65, 0.80, 0.95, 0.95, "NDC");
         info->SetFillStyle(0);
         info->SetBorderSize(0);
@@ -1373,23 +1602,56 @@ legRadii->AddEntry(gRlong, "R_{long}", "P");
 legRadii->Draw();
 
 // Pad 3: lambda – using 1mm cutoff
+// Pad 3: lambda for ALL rho_max^lambda cutoffs, overlaid
 c_mT->cd(3);
-const auto& lam1mm = lambda_by_cutoff["1mm"];
-const auto& lam1mmErr = lambda_err_by_cutoff["1mm"];
-if (lam1mm.size() == nPoints) {
-    TGraphErrors *gLambda = new TGraphErrors(nPoints,
-        &mt_vals[0], &lam1mm[0],
-        &mt_err[0],  &lam1mmErr[0]);
-    gLambda->SetTitle("#lambda_{1mm} vs m_{T}; m_{T} [GeV/c^2]; #lambda");
-    gLambda->SetMarkerStyle(20);
-    gLambda->SetMarkerColor(kBlack);
-    gLambda->GetYaxis()->SetRangeUser(0.0, 1.1);
-    gLambda->Draw("AP");
+
+int lambdaColors[4]  = {kBlack, kRed, kBlue, kGreen+2};
+int lambdaMarkers[4] = {20, 21, 22, 23};
+
+TLegend *legLambda = new TLegend(0.60, 0.65, 0.88, 0.88);
+legLambda->SetBorderSize(0);
+legLambda->SetFillStyle(0);
+legLambda->SetTextSize(0.03);
+
+bool firstDrawn = false;
+
+for (size_t ic = 0; ic < rhoLambdaCutoffs.size(); ++ic) {
+    const string& label = rhoLambdaCutoffs[ic].first;
+    double rhoLamMaxVal = rhoLambdaCutoffs[ic].second;
+
+    const auto& lamVals = lambda_by_cutoff[label];
+    const auto& lamErrs = lambda_err_by_cutoff[label];
+
+    if ((int)lamVals.size() != nPoints) continue; // skip incomplete cutoffs
+
+    TGraphErrors *g = new TGraphErrors(nPoints,
+        &mt_vals[0], &lamVals[0],
+        &mt_err[0],  &lamErrs[0]);
+
+    g->SetMarkerStyle(lambdaMarkers[ic % 4]);
+    g->SetMarkerColor(lambdaColors[ic % 4]);
+    g->SetLineColor(lambdaColors[ic % 4]);
+
+    if (!firstDrawn) {
+        g->SetTitle("#lambda vs m_{T}; m_{T} [GeV/c^{2}]; #lambda");
+        g->GetYaxis()->SetRangeUser(0.0, 1.1);
+        g->Draw("AP");
+        firstDrawn = true;
+    } else {
+        g->Draw("P SAME");
+    }
+
+    legLambda->AddEntry(g, Form("#rho_{max}^{#lambda} = %.0e fm (%s)",
+                                 rhoLamMaxVal, label.c_str()), "P");
+}
+
+if (firstDrawn) {
+    legLambda->Draw();
 } else {
     TPaveText* warn = new TPaveText(0.15, 0.45, 0.85, 0.60, "NDC");
     warn->SetBorderSize(0);
     warn->SetFillStyle(0);
-    warn->AddText("Incomplete #lambda results for 1mm");
+    warn->AddText("Incomplete #lambda results");
     warn->Draw();
 }
 
