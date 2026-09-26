@@ -1,5 +1,5 @@
 // ============================================================
-// Au Au 200 Gev epos data analysis 
+// EPOS Au+Au 200 GeV analysis – 3D Lévy fits with cutoff loop
 // ============================================================
 #include <TFile.h>
 #include <TTree.h>
@@ -21,6 +21,11 @@
 #include <map>
 #include <cmath>
 #include <algorithm>
+#include <fstream>
+#include <limits>
+
+#include "Levy_proj_reader.h"
+
 using namespace std;
 
 // ============ Configuration ============
@@ -36,8 +41,15 @@ const double kT_lo_edge   = 0.15;
 const double kT_hi_edge   = 0.85;
 const int    nBins_kT = (int)((kT_hi_edge - kT_lo_edge) / kT_bin_width);
 
-// Levy projection
-#include "Levy_proj_reader.h"
+// Cutoff labels retained for the lambda CSV; fit normalisation follows the first code
+vector<pair<string, double>> rhoLambdaCutoffs = {
+    {"1mm",   1.0e12},
+    {"5mm",   5.0e12},
+    {"5cm",   5.0e13},
+    {"50cm",  5.0e14}
+};
+
+// Levy projection reader
 Levy_reader* myLevy_reader;
 
 double LevyProj1DFunc(const double *x, const double *par) {
@@ -48,11 +60,11 @@ double LevyProj1DFunc(const double *x, const double *par) {
     return (2.*N / Rcc) * myLevy_reader->getValue_1d(alpha, x[0]/Rcc);
 }
 
-// ============ LogLikelihood ============
+// ============ LogLikelihood (same normalisation convention as the first code) ============
 class LogLikelihood {
 public:
     LogLikelihood(TH1F* hOut, TH1F* hSide, TH1F* hLong,
-                    double xmin, double xmax, int* binsUsed)
+                  double xmin, double xmax, int* binsUsed)
     : hOut_(hOut), hSide_(hSide), hLong_(hLong),
       xMin(xmin), xMax(xmax), nBinsUsed(binsUsed) {
         *nBinsUsed = 0;
@@ -66,31 +78,44 @@ public:
         }
     }
 
-   double operator()(const double* par) const {
-    double alpha = par[0];
-    double Rout  = par[1];
-    double Rside = par[2];
-    double Rlong = par[3];
-    double N     = par[4];
-    double logL = 0;
-    TH1F* hists[3] = {hOut_, hSide_, hLong_};
-    double Rvals[3] = {Rout, Rside, Rlong};
-    for (int idir=0; idir<3; ++idir) {
-        TH1F* h = hists[idir];
-        double R = Rvals[idir];
-        for (int i=1; i<=h->GetNbinsX(); ++i) {
-            double xc = h->GetBinCenter(i);
-            if (xc < xMin || xc > xMax) continue;
-            double data = h->GetBinContent(i);
-            if (data <= 0) continue;
-            double pars[3] = {alpha, R, N};
-            double model = LevyProj1DFunc(&xc, pars);
-            if (model < 1e-30) model = 1e-30;
-            logL += data * log(model / data) + (data - model);
+    double operator()(const double* par) const {
+        double alpha = par[0];
+        double Rout  = par[1];
+        double Rside = par[2];
+        double Rlong = par[3];
+        double N     = par[4];
+
+        double logL = 0;
+        TH1F* hists[3] = {hOut_, hSide_, hLong_};
+        double Rvals[3] = {Rout, Rside, Rlong};
+
+        for (int idir=0; idir<3; ++idir) {
+            TH1F* h = hists[idir];
+            double R = Rvals[idir];
+
+            // The histogram is already normalised over [xMin, xMax].
+            // Do NOT renormalise it again here.
+            for (int i=1; i<=h->GetNbinsX(); ++i) {
+                double xc = h->GetBinCenter(i);
+                if (xc < xMin || xc > xMax) continue;
+                double data = h->GetBinContent(i);
+
+                double pars[3] = {alpha, R, N};
+                double model = LevyProj1DFunc(&xc, pars);
+                if (model < 1e-30) model = 1e-30;
+
+                // Fix: include empty bins in the Poisson deviance so the
+                // upper tail constrains the fit (do not skip them).
+                if (data > 0.0) {
+                    logL += data * log(model / data) + (data - model);
+                } else {
+                    logL += 2.0 * model;
+                }
+            }
         }
+        return -2.0 * logL;
     }
-    return -2.0 * logL;
-}
+
 
 private:
     TH1F *hOut_, *hSide_, *hLong_;
@@ -98,15 +123,14 @@ private:
     int* nBinsUsed;
 };
 
-
 // ============ Main ============
-void epos_hbt_3D() {
+void epos_hbt_3D_robust() {
 
     gRandom->SetSeed(12345);
     TStopwatch sw;
     sw.Start();
 
-    // ---- Collect ROOT files READING ----
+    // ---- Collect ROOT files ----
     TString dir = gSystem->pwd();
     TString cmd = Form("ls %s/z-gg2my59a-*.root", dir.Data());
     TString filelist = gSystem->GetFromPipe(cmd);
@@ -116,7 +140,7 @@ void epos_hbt_3D() {
     for (int i = 0; i < tokens->GetEntries(); i++) {
         TString fn = tokens->At(i)->GetName();
         if (!fn.Contains(".root")) continue;
-        if (fn.Contains("z-gg2my59a-261.root")) continue;
+        if (fn.Contains("z-gg2my59a-261.root")) continue; // skip problematic file
         filenames.push_back(fn);
     }
     sort(filenames.begin(), filenames.end());
@@ -131,8 +155,6 @@ void epos_hbt_3D() {
     float  px[MAXP], py[MAXP], pz[MAXP], e_ch[MAXP];
     float  xr[MAXP], yr[MAXP], zr[MAXP], tr[MAXP];
     int    id_ch[MAXP], ist_ch[MAXP];
-     
-    float xfr[MAXP], yfr[MAXP], zfr[MAXP], tfr[MAXP];    //frezzout frame channel
 
     chain->SetBranchAddress("np",  &np_ch);
     chain->SetBranchAddress("px",  px);
@@ -145,27 +167,19 @@ void epos_hbt_3D() {
     chain->SetBranchAddress("t",   tr);
     chain->SetBranchAddress("id",  id_ch);
     chain->SetBranchAddress("ist", ist_ch);
-     
 
-    // ---- Storage per kT bin ----
+    // ---- kT centers ----
     vector<double> kt_centers(nBins_kT);
     for (int i = 0; i < nBins_kT; i++)
         kt_centers[i] = kT_lo_edge + (i + 0.5) * kT_bin_width;
-       
-       chain->Print();
 
-    // ============ D(rho) histograms per kT bin ============
+    // ---- D(rho) histograms per kT bin ----
     const int n_rho_bins = 300;
     double rho_min = 0.1, rho_max = 1e15;
     double rho_edges[n_rho_bins + 1];
     double r_factor = pow(rho_max / rho_min, 1.0 / n_rho_bins);
     rho_edges[0] = rho_min;
     for (int i = 1; i <= n_rho_bins; i++) rho_edges[i] = rho_edges[i-1] * r_factor;
-
-    // ============ LOOP OVER EVENTS ============
-    long long nEntries = chain->GetEntries();
-    int nEvents = (int)nEntries;  // for display
-    cout << "Processing " << nEntries << " events..." << endl;
 
     vector<TH1F*> hOut_all(nBins_kT), hSide_all(nBins_kT), hLong_all(nBins_kT);
     for (int i = 0; i < nBins_kT; i++) {
@@ -181,6 +195,11 @@ void epos_hbt_3D() {
     int pair_count_per_bin[nBins_kT];
     for (int i = 0; i < nBins_kT; i++) pair_count_per_bin[i] = 0;
 
+    // ---- Event loop ----
+    long long nEntries = chain->GetEntries();
+    int nEvents = (int)nEntries;
+    cout << "Processing " << nEntries << " events..." << endl;
+
     for (long long ie = 0; ie < nEntries; ie++) {
         chain->GetEntry(ie);
         int npUse = min(np_ch, MAXP);
@@ -188,7 +207,7 @@ void epos_hbt_3D() {
         struct SimpleParticle {
             float px, py, pz, E;
             float x, y, z, t;
-             int id; 
+            int id;
         };
         vector<SimpleParticle> pions;
 
@@ -200,11 +219,11 @@ void epos_hbt_3D() {
             double eta = 0.5 * log((pp + pz[ip]) / (pp - pz[ip]));
             if (pt < pT_min || pt > pT_max) continue;
             if (fabs(eta) > eta_cut) continue;
-            
+
             SimpleParticle sp;
             sp.px = px[ip]; sp.py = py[ip]; sp.pz = pz[ip]; sp.E = e_ch[ip];
             sp.x  = xr[ip]; sp.y  = yr[ip]; sp.z  = zr[ip]; sp.t  = tr[ip];
-            sp.id = id_ch[ip];      // store PDG code
+            sp.id = id_ch[ip];
             pions.push_back(sp);
         }
 
@@ -213,7 +232,6 @@ void epos_hbt_3D() {
             const auto& p1 = pions[i];
             for (size_t j = i+1; j < pions.size(); j++) {
                 const auto& p2 = pions[j];
-                
                 if (p1.id != p2.id) continue;
 
                 double kx = 0.5*(p1.px + p2.px);
@@ -234,24 +252,34 @@ void epos_hbt_3D() {
                 double qLCMS = sqrt(qx*qx + qy*qy + qzL);
                 if (qLCMS > qmCut) continue;
 
-double dx = p1.x - p2.x;
-double dy = p1.y - p2.y;
-double dz = p1.z - p2.z;
-double dt = p1.t - p2.t;
+                double dx = p1.x - p2.x;
+                double dy = p1.y - p2.y;
+                double dz = p1.z - p2.z;
+                double dt = p1.t - p2.t;
 
+                double K0 = 0.5*(p1.E + p2.E);
+                double kp = K0*K0 - kz*kz;
+                double phi = atan2(ky, kx);
 
-double K0 = 0.5*(p1.E + p2.E);
-double kp = K0*K0 - kz*kz;
-double phi = atan2(ky, kx);
+                if (!(kp > 0.0) ||
+                    !std::isfinite(kp)) {
+                    continue;
+                }
 
-double r_side = -sin(phi)*dx + cos(phi)*dy;
-//double r_out  = cos(phi)*dx + sin(phi)*dy  - (kT/kp) * (K0*dt - kz*dz);
-double r_out  = TMath::Cos(phi) * dx + TMath::Sin(phi) * dy;
-double r_long = (K0*dz - kz*dt) / sqrt(kp);
+                if (!(kT > 0.0) ||
+                    !std::isfinite(kT)) {
+                    continue;
+                }
+                double r_side = -sin(phi)*dx + cos(phi)*dy;
 
+                double r_out  = cos(phi)*dx + sin(phi)*dy - (kT / kp)
+                      * (K0 * dt - kz * dz);
+                double r_long = (K0*dz - kz*dt) / sqrt(kp);
+                // rout including the time boost
+                //double r_out  = cos(phi)*dx + sin(phi)*dy - (kT/kp) * (K0*dt - kz*dz);
 
                 double rho = sqrt(r_out*r_out + r_side*r_side + r_long*r_long);
-                
+
                 hOut_all[ibin]->Fill(fabs(r_out));
                 hSide_all[ibin]->Fill(fabs(r_side));
                 hLong_all[ibin]->Fill(fabs(r_long));
@@ -265,197 +293,285 @@ double r_long = (K0*dz - kz*dt) / sqrt(kp);
     }
 
     cout << "\nTotal pairs: " << total_pairs_all << endl;
-    cout << "\nPairs per kT bin:" << endl;
     for (int i = 0; i < nBins_kT; i++) {
         cout << "  kT=[" << kt_centers[i]-kT_bin_width/2 << "-"
              << kt_centers[i]+kT_bin_width/2 << "]: "
              << pair_count_per_bin[i] << " pairs" << endl;
     }
 
-  myLevy_reader = new Levy_reader("levy_proj3D_values.dat");
+    // ---- Load Levy table ----
+    myLevy_reader = new Levy_reader("levy_proj3D_values.dat");
+    // ---- Storage for results ----
+    // Per kT bin, we store the base parameters (alpha, R's) only once (using a reference cutoff, e.g., 1mm)
+    vector<double> mt_vals, mt_err_vals;
+    vector<double> alpha_vals, alpha_err_vals;
+    vector<double> Rout_vals, Rout_err_vals;
+    vector<double> Rside_vals, Rside_err_vals;
+    vector<double> Rlong_vals, Rlong_err_vals;
+    vector<double> logL_vals, ndf_vals, fit_status_vals;
 
-
-// ============ Storage for results ============
-vector<double> mt_vals, mt_err_vals;
-vector<double> alpha_vals, alpha_err_vals;
-vector<double> Rout_vals, Rout_err_vals;
-vector<double> Rside_vals, Rside_err_vals;
-vector<double> Rlong_vals, Rlong_err_vals;
-vector<double> lam_vals, lam_err_vals;
-vector<double> fitmax_vals;
-vector<double> logL_vals, ndf_vals;
-
-
-// ============ FIT EACH kT BIN ============
-cout << "\n=== FITTING D(rho) with Levy ===" << endl;
-
-double startSets[][5] = {
-    {1.0,  8.0, 3.0, 4.0, 1.0},
-    {1.3, 10.0, 2.5, 3.5, 0.8},
-    {1.6, 15.0, 4.0, 5.0, 1.2},
-    {1.9, 20.0, 3.5, 6.0, 0.6},
-    {2.2, 12.0, 2.0, 3.0, 1.4}
-};
-
-
-for (int ibin = 0; ibin < nBins_kT; ibin++) {
-    double kT_lo = kT_lo_edge + ibin * kT_bin_width;
-    double kT_hi = kT_lo + kT_bin_width;
-    double kT_m  = kt_centers[ibin];
-    double mT    = sqrt(kT_m*kT_m + m_pi*m_pi);
-    double fit_max = 100;
-    double fit_min = 0.1;
-
-
-
-    if (pair_count_per_bin[ibin] < 100) {
-        cout << "  kT=[" << kT_lo << "-" << kT_hi
-             << "] SKIPPED: only " << pair_count_per_bin[ibin] << " pairs" << endl;
-        continue;
+    // Lambda per cutoff: map cutoff_label -> vector of lambda values (one per kT bin)
+    map<string, vector<double>> lambda_by_cutoff;
+    map<string, vector<double>> lambda_err_by_cutoff;
+    // No need to pre‑initialize; operator[] will create empty vectors when first used.
+    for (auto& lc : rhoLambdaCutoffs) {
+        lambda_by_cutoff[lc.first] = {};
+        lambda_err_by_cutoff[lc.first] = {};
     }
 
-    // ============================================
-    // Check FIT STRATEGY 
-    // ============================================
-    // 1. Clone and normalize each direction histogram over the fit range
-    TH1F* hOutNorm = (TH1F*)hOut_all[ibin]->Clone();
-    TH1F* hSideNorm = (TH1F*)hSide_all[ibin]->Clone();
-    TH1F* hLongNorm = (TH1F*)hLong_all[ibin]->Clone();
-    hOutNorm->SetDirectory(0);
-    hSideNorm->SetDirectory(0);
-    hLongNorm->SetDirectory(0);
-
-    int binLow = hOutNorm->FindBin(fit_min);
-    int binHigh = hOutNorm->FindBin(fit_max);
-
-    double integralOut = hOutNorm->Integral(binLow, binHigh, "width");
-    double integralSide = hSideNorm->Integral(binLow, binHigh, "width");
-    double integralLong = hLongNorm->Integral(binLow, binHigh, "width");
-
-    if (integralOut > 0) hOutNorm->Scale(1.0 / integralOut, "width");
-    if (integralSide > 0) hSideNorm->Scale(1.0 / integralSide, "width");
-    if (integralLong > 0) hLongNorm->Scale(1.0 / integralLong, "width");
-
-    // 2. Build the likelihood function (5 parameters)
-    int actualBins = 0;
-    LogLikelihood loglikfunc(hOutNorm, hSideNorm, hLongNorm, fit_min, fit_max, &actualBins);
-
-    if (actualBins < 30) { // Need enough bins for a stable fit
-        cout << "  kT=[" << kT_lo << "-" << kT_hi
-             << "] SKIPPED: only " << actualBins << " bins with data" << endl;
-        delete hOutNorm;
-        delete hSideNorm;
-        delete hLongNorm;
-        continue;
+    // ---- CSV file ----
+    ofstream csvFile("EPOS_Levy_fit_parameters_cutoff.csv");
+    if (!csvFile.is_open()) {
+        cerr << "ERROR: Could not open EPOS_Levy_fit_parameters_cutoff.csv" << endl;
+        return;
     }
-ROOT::Math::Functor f(loglikfunc, 5);  
 
-// 3. Try multiple starting points (as in SMASH)
-bool fitConverged = false;
-double bestChi2 = 1e30;
-double bestPar[5] = {0, 0, 0, 0, 0};
-double bestErr[5] = {0, 0, 0, 0, 0};
+    // CSV header
+    csvFile << "kT_low,kT_high,kT_center,mT,N_pairs,"
+            << "alpha,alpha_err,"
+            << "Rout,Rout_err,"
+            << "Rside,Rside_err,"
+            << "Rlong,Rlong_err,";
+    for (auto& lc : rhoLambdaCutoffs) {
+        csvFile << lc.first << "_lambda," << lc.first << "_lambda_err,";
+    }
+    csvFile << "chi2,ndf,fit_status\n";
 
+    // ---- Fit each kT bin ----
+    cout << "\n=== FITTING D(rho) with Lévy (cutoff loop) ===" << endl;
 
-for (int iattempt = 0; iattempt < 5; iattempt++) {
-    ROOT::Math::Minimizer* minimizer =
-        ROOT::Math::Factory::CreateMinimizer("Minuit2", "Migrad");
-    minimizer->SetFunction(f);
-    minimizer->SetMaxFunctionCalls(50000);
-    minimizer->SetMaxIterations(50000);
-    minimizer->SetTolerance(1e-4);
-    minimizer->SetStrategy(2);
-    minimizer->SetPrintLevel(-1);
-    
-    minimizer->SetLimitedVariable(0, "alpha", startSets[iattempt][0], 0.1, 0.5, 2.5);
-    minimizer->SetLimitedVariable(1, "Rout",  startSets[iattempt][1], 0.1, 0.5, 30.0);
-    minimizer->SetLimitedVariable(2, "Rside", startSets[iattempt][2], 0.1, 0.5, 30.0);
-    minimizer->SetLimitedVariable(3, "Rlong", startSets[iattempt][3], 0.1, 0.5, 30.0);
-    minimizer->SetLimitedVariable(4, "N",     startSets[iattempt][4], 0.01, 0.0, 1.5);
+    double startSets[][5] = {
+        {1.0,  8.0, 3.0, 4.0, 1.0},
+        {1.3, 10.0, 2.5, 3.5, 0.8},
+        {1.6, 15.0, 4.0, 5.0, 1.2},
+        {1.9, 20.0, 3.5, 6.0, 0.6},
+        {2.2, 12.0, 2.0, 3.0, 1.4}
+    };
 
-    minimizer->Minimize();
+    for (int ibin = 0; ibin < nBins_kT; ibin++) {
+        double kT_lo = kT_lo_edge + ibin * kT_bin_width;
+        double kT_hi = kT_lo + kT_bin_width;
+        double kT_m  = kt_centers[ibin];
+        double mT    = sqrt(kT_m*kT_m + m_pi*m_pi);
 
-    if (minimizer->Status() == 0) {
-        double chi2val = minimizer->MinValue();
-        if (!fitConverged || chi2val < bestChi2) {
-            fitConverged = true;
-            bestChi2 = chi2val;
-            const double* px = minimizer->X();
-            const double* pe = minimizer->Errors();
-            for (int ip = 0; ip < 5; ip++) {
-                bestPar[ip] = px[ip];
-                bestErr[ip] = pe[ip];
-            }
+        if (pair_count_per_bin[ibin] < 100) {
+            cout << "  kT=[" << kT_lo << "-" << kT_hi
+                 << "] SKIPPED: only " << pair_count_per_bin[ibin] << " pairs" << endl;
+            continue;
         }
-    }
-    delete minimizer;
-}
-// 4. Store results if fit converged
-if (fitConverged) {
-    mt_vals.push_back(mT);
-    mt_err_vals.push_back(0.0);
 
-    alpha_vals.push_back(bestPar[0]);
-    alpha_err_vals.push_back(bestErr[0]);
+        // ---- Prepare histograms (will be cloned for each cutoff) ----
+        TH1F* hOutOrig = hOut_all[ibin];
+        TH1F* hSideOrig = hSide_all[ibin];
+        TH1F* hLongOrig = hLong_all[ibin];
 
-    Rout_vals.push_back(bestPar[1]);
-    Rout_err_vals.push_back(bestErr[1]);
+        // For this bin, we will store the best parameters from the first cutoff (1mm)
+        bool baseParamsStored = false;
+        double bestAlpha, bestAlphaErr, bestRout, bestRoutErr, bestRside, bestRsideErr, bestRlong, bestRlongErr;
+        double bestChi2 = -1, bestNdf = -1, bestStatus = -1;
+        double fit_min = 0.1;
+        double fit_max = sqrt(2500.0 / mT);
 
-    Rside_vals.push_back(bestPar[2]);
-    Rside_err_vals.push_back(bestErr[2]);
+        // ---- Loop over cutoff labels ----
+        // Cutoff labels are retained for the CSV/output structure, but the
+        // FIT NORMALISATION is now exactly the same as in the first code:
+        // each histogram is normalised over [fit_min, fit_max].
+        // Therefore changing rhoLamMax does not change the fitted parameters.
+        for (auto& lc : rhoLambdaCutoffs) {
+            const string& label = lc.first;
+            const double rhoLamMax = lc.second; 
 
-    Rlong_vals.push_back(bestPar[3]);
-    Rlong_err_vals.push_back(bestErr[3]);
+            // Clone and normalise each direction histogram over the FIT RANGE ONLY.
+            TH1F* hOutNorm = (TH1F*)hOutOrig->Clone();
+            TH1F* hSideNorm = (TH1F*)hSideOrig->Clone();
+            TH1F* hLongNorm = (TH1F*)hLongOrig->Clone();
+            hOutNorm->SetDirectory(0);
+            hSideNorm->SetDirectory(0);
+            hLongNorm->SetDirectory(0);
 
-    lam_vals.push_back(bestPar[4]);
-    lam_err_vals.push_back(bestErr[4]);
+            int binLowOut   = hOutNorm->FindBin(fit_min);
+            int binHighOut  = hOutNorm->FindBin(fit_max);
+            int binLowSide  = hSideNorm->FindBin(fit_min);
+            int binHighSide = hSideNorm->FindBin(fit_max);
+            int binLowLong  = hLongNorm->FindBin(fit_min);
+            int binHighLong = hLongNorm->FindBin(fit_max);
 
-    fitmax_vals.push_back(fit_max);
+            double integralOut = hOutNorm->Integral(binLowOut, binHighOut, "width");
+            double integralSide = hSideNorm->Integral(binLowSide, binHighSide, "width");
+            double integralLong = hLongNorm->Integral(binLowLong, binHighLong, "width");
 
-    int ndf = actualBins - 5;  // 5 parameters
-    logL_vals.push_back(bestChi2);
-    ndf_vals.push_back(ndf);
+            if (integralOut > 0) hOutNorm->Scale(1.0 / integralOut, "width");
+            if (integralSide > 0) hSideNorm->Scale(1.0 / integralSide, "width");
+            if (integralLong > 0) hLongNorm->Scale(1.0 / integralLong, "width");
 
-    cout << "  kT=[" << kT_lo << "-" << kT_hi << "] "
-         << pair_count_per_bin[ibin] << " pairs: "
-         << "alpha=" << bestPar[0] << "+-" << bestErr[0]
-         << "  Rout=" << bestPar[1] << "+-" << bestErr[1]
-         << "  Rside=" << bestPar[2] << "+-" << bestErr[2]
-         << "  Rlong=" << bestPar[3] << "+-" << bestErr[3]
-         << "  lambda=" << bestPar[4] << "+-" << bestErr[4]
-         << "  -logL/NDF=" << bestChi2 << "/" << ndf << endl;
-} else {
-    cout << "  kT=[" << kT_lo << "-" << kT_hi
-         << "] FIT FAILED to converge" << endl;
-}
+            // The histograms are already normalised above; LogLikelihood
+            // must use their bin contents directly (no second normalisation).
+            int actualBins = 0;
+            LogLikelihood loglikfunc(hOutNorm, hSideNorm, hLongNorm,
+                                     fit_min, fit_max, &actualBins);
+            if (actualBins < 30) {
+                cout << "  kT=[" << kT_lo << "-" << kT_hi
+                     << "] cutoff " << label << ": only " << actualBins << " bins with data, skip" << endl;
+                delete hOutNorm; delete hSideNorm; delete hLongNorm;
+                continue;
+            }
 
-// 5. Clean up
-delete hOutNorm;
-delete hSideNorm;
-delete hLongNorm;
-}
-// ============================================================
-// DRAW D(rho) per kT bin (3-pad: out, side, long)
-// ============================================================
-string dirNames[3] = {"out", "side", "long"};
+            ROOT::Math::Functor f(loglikfunc, NPAR);
 
+            // ---- Multiple starting points ----
+            bool fitConverged = false;
+            double bestLocalChi2 = 1e30;
+            double bestLocalPar[5] = {0,0,0,0,0};
+            double bestLocalErr[5] = {0,0,0,0,0};
+            double bestLocalStatus = -1; // Fix: capture the real Minuit status
 
-for (int ibin = 0; ibin < nBins_kT; ibin++) {
-    if (pair_count_per_bin[ibin] < 100) continue;
+            for (int iattempt = 0; iattempt < 5; iattempt++) {
+                ROOT::Math::Minimizer* minimizer =
+                    ROOT::Math::Factory::CreateMinimizer("Minuit2", "Migrad");
+                minimizer->SetFunction(f);
+                minimizer->SetMaxFunctionCalls(50000);
+                minimizer->SetMaxIterations(50000);
+                minimizer->SetTolerance(1e-4);
+                minimizer->SetStrategy(2);
+                minimizer->SetPrintLevel(-1);
 
+                minimizer->SetLimitedVariable(0, "alpha", startSets[iattempt][0], 0.1, 0.5, 2.5);
 
-    double kT_lo = kT_lo_edge + ibin * kT_bin_width;
-    double kT_hi = kT_lo + kT_bin_width;
-    double kT_m  = kt_centers[ibin];
-    double mT    = sqrt(kT_m*kT_m + m_pi*m_pi);
-    double fit_max_disp = sqrt(2500.0 / mT);
+                minimizer->SetLimitedVariable(1, "Rout",  startSets[iattempt][1], 0.1, 0.5, 30.0);
+                minimizer->SetLimitedVariable(2, "Rside", startSets[iattempt][2], 0.1, 0.5, 30.0);
+                minimizer->SetLimitedVariable(3, "Rlong", startSets[iattempt][3], 0.1, 0.5, 20.0);
 
+                minimizer->SetLimitedVariable(4, "N",     startSets[iattempt][4], 0.01, 0.0, 1.0);
 
-    // Find fit results for this bin
-    bool found = false;
-    for (size_t j = 0; j < mt_vals.size(); j++) {
-        if (fabs(mt_vals[j] - mT) < 0.01) {
+                minimizer->Minimize();
 
+                if (minimizer->Status() == 0) {
+                    // Fix: call Hesse() to get proper Hessian-based errors
+                    minimizer->Hesse();
+                    double chi2val = minimizer->MinValue();
+                    if (!fitConverged || chi2val < bestLocalChi2) {
+                        fitConverged = true;
+                        bestLocalChi2 = chi2val;
+                        bestLocalStatus = minimizer->Status();
+                        const double* px = minimizer->X();
+                        const double* pe = minimizer->Errors();
+                        for (int ip = 0; ip < 5; ip++) {
+                            bestLocalPar[ip] = px[ip];
+                            bestLocalErr[ip] = pe[ip];
+                        }
+                    }
+                }
+                delete minimizer;
+            }
+
+            // ---- Store results ----
+            if (fitConverged) {
+                // Store lambda for this cutoff
+                lambda_by_cutoff[label].push_back(bestLocalPar[4]);
+                lambda_err_by_cutoff[label].push_back(bestLocalErr[4]);
+
+                // Store base parameters from the first cutoff iteration (all iterations use the same fit normalisation)
+                if (!baseParamsStored) {
+                    baseParamsStored = true;
+                    bestAlpha = bestLocalPar[0];
+                    bestAlphaErr = bestLocalErr[0];
+                    bestRout = bestLocalPar[1];
+                    bestRoutErr = bestLocalErr[1];
+                    bestRside = bestLocalPar[2];
+                    bestRsideErr = bestLocalErr[2];
+                    bestRlong = bestLocalPar[3];
+                    bestRlongErr = bestLocalErr[3];
+                    bestChi2 = bestLocalChi2;
+                    
+                    bestNdf = actualBins - NPAR;
+                    // Fix: store the real status instead of the hardcoded 1
+                    bestStatus = bestLocalStatus;
+
+                    // Store in global vectors (for mT plots)
+                    mt_vals.push_back(mT);
+                    mt_err_vals.push_back(0.0);
+                    alpha_vals.push_back(bestAlpha);
+                    alpha_err_vals.push_back(bestAlphaErr);
+                    Rout_vals.push_back(bestRout);
+                    Rout_err_vals.push_back(bestRoutErr);
+                    Rside_vals.push_back(bestRside);
+                    Rside_err_vals.push_back(bestRsideErr);
+                    Rlong_vals.push_back(bestRlong);
+                    Rlong_err_vals.push_back(bestRlongErr);
+                    logL_vals.push_back(bestChi2);
+                    ndf_vals.push_back(bestNdf);
+                    fit_status_vals.push_back(bestStatus);
+                }
+
+                cout << "  kT=[" << kT_lo << "-" << kT_hi << "] " << label
+                     << " λ = " << bestLocalPar[4] << " +/- " << bestLocalErr[4] << endl;
+            } else {
+                cout << "  kT=[" << kT_lo << "-" << kT_hi << "] " << label
+                     << " fit did not converge" << endl;
+
+                // Fix: store NaN placeholders (already present, kept identical)
+                const double NaN =
+                    std::numeric_limits<double>::quiet_NaN();
+
+                lambda_by_cutoff[label].push_back(NaN);
+                lambda_err_by_cutoff[label].push_back(NaN);
+            }
+
+            delete hOutNorm;
+            delete hSideNorm;
+            delete hLongNorm;
+        } // end cutoff loop
+
+        // ---- Write CSV row for this kT bin ----
+        if (baseParamsStored) {
+            csvFile << fixed << setprecision(8)
+                    << kT_lo << ","
+                    << kT_hi << ","
+                    << kT_m << ","
+                    << mT << ","
+                    << pair_count_per_bin[ibin] << ","
+                    << bestAlpha << "," << bestAlphaErr << ","
+                    << bestRout << "," << bestRoutErr << ","
+                    << bestRside << "," << bestRsideErr << ","
+                    << bestRlong << "," << bestRlongErr << ",";
+
+            // Lambda values for each cutoff (must be in same order as rhoLambdaCutoffs)
+            for (auto& lc : rhoLambdaCutoffs) {
+                const string& label = lc.first;
+                double lam = lambda_by_cutoff[label].back();
+                double lamErr = lambda_err_by_cutoff[label].back();
+                csvFile << lam << "," << lamErr << ",";
+            }
+            csvFile << bestChi2 << "," << bestNdf << "," << bestStatus << "\n";
+            csvFile.flush();
+        }
+    } // end kT bin loop
+
+    csvFile.close();
+    cout << "\nSaved fitted parameters to: EPOS_Levy_fit_parameters_cutoff.csv" << endl;
+
+    // ============================================================
+    // Draw D(rho) per kT bin (using 1mm cutoff fit for display)
+    // ============================================================
+    int nPoints = mt_vals.size();
+    if (nPoints > 0) {
+        // For drawing we need to match the stored base parameters (index j) with the kT bin.
+        // We'll just loop over bins and find the matching mT.
+        for (int ibin = 0; ibin < nBins_kT; ibin++) {
+            if (pair_count_per_bin[ibin] < 100) continue;
+            double kT_lo = kT_lo_edge + ibin * kT_bin_width;
+            double kT_hi = kT_lo + kT_bin_width;
+            double kT_m  = kt_centers[ibin];
+            double mT    = sqrt(kT_m*kT_m + m_pi*m_pi);
+
+            // Find index in stored vectors
+            int idx = -1;
+            for (size_t j = 0; j < mt_vals.size(); j++) {
+                if (fabs(mt_vals[j] - mT) < 0.01) { idx = j; break; }
+            }
+            if (idx < 0) continue;
+
+            double fit_max_disp = sqrt(2500.0 / mT);
 
             TCanvas* cSample = new TCanvas(
                 Form("cDrho_kT%d", ibin),
@@ -463,11 +579,10 @@ for (int ibin = 0; ibin < nBins_kT; ibin++) {
                 1800, 600);
             cSample->Divide(3, 1);
 
-
             TH1F* hists[3] = {hOut_all[ibin], hSide_all[ibin], hLong_all[ibin]};
-            double Rvals[3] = {Rout_vals[j], Rside_vals[j], Rlong_vals[j]};
-            double Rerrs[3] = {Rout_err_vals[j], Rside_err_vals[j], Rlong_err_vals[j]};
-
+            double Rvals[3] = {Rout_vals[idx], Rside_vals[idx], Rlong_vals[idx]};
+            double Rerrs[3] = {Rout_err_vals[idx], Rside_err_vals[idx], Rlong_err_vals[idx]};
+            string dirNames[3] = {"out", "side", "long"};
 
             for (int idir = 0; idir < 3; idir++) {
                 cSample->cd(idir + 1);
@@ -475,15 +590,29 @@ for (int ibin = 0; ibin < nBins_kT; ibin++) {
                 gPad->SetLogy();
                 gPad->SetLeftMargin(0.15);
 
-
-                // Clone, normalize over fit range, draw
+                // Clone and normalise over the FIT RANGE, exactly as in the first code.
                 TH1F* h = (TH1F*)hists[idir]->Clone();
                 h->SetDirectory(0);
-                int bLo = h->FindBin(rho_min);
-                int bHi = h->FindBin(fit_max_disp);
-                double intFit = h->Integral(bLo, bHi, "width");
-                if (intFit > 0) h->Scale(1.0 / intFit, "width");
 
+                // Normalize over the full source up to rhoLamMax.
+                // Fix: use bin index 1 (not the rho value 0.1) as lower edge.
+                const int firstPhysicalBin = 1;
+
+                int lastLambdaBin =
+                    h->FindBin(1e12);
+
+                if (lastLambdaBin > h->GetNbinsX()) {
+                    lastLambdaBin = h->GetNbinsX();
+                }
+
+                double normalizationCount =
+                    h->Integral(firstPhysicalBin, lastLambdaBin);
+
+                if (normalizationCount > 0.0) {
+                    h->Scale(1.0 / normalizationCount, "width");
+                }
+
+                const double display_fit_min = 0.1;
 
                 h->SetMinimum(1e-25);
                 h->SetMaximum(1e0);
@@ -497,9 +626,8 @@ for (int ibin = 0; ibin < nBins_kT; ibin++) {
                                  dirNames[idir].c_str()));
                 h->Draw("E1");
 
-
-                // Draw Levy fit function
-                double pars[3] = {alpha_vals[j], Rvals[idir], lam_vals[j]};
+                // Draw Lévy fit function using parameters from 1mm cutoff
+                double pars[3] = {alpha_vals[idx], Rvals[idir], lambda_by_cutoff["1mm"][idx]};
                 TF1* func = new TF1(
                     Form("func_%s_kT%d", dirNames[idir].c_str(), ibin),
                     [&](double* x, double* par_fit) {
@@ -511,7 +639,6 @@ for (int ibin = 0; ibin < nBins_kT; ibin++) {
                 func->SetLineWidth(2);
                 func->Draw("SAME");
 
-
                 // Fit range vertical line
                 TLine* lFitMax = new TLine(fit_max_disp, 1e-25, fit_max_disp, 1e0);
                 lFitMax->SetLineColor(kGray + 2);
@@ -519,23 +646,22 @@ for (int ibin = 0; ibin < nBins_kT; ibin++) {
                 lFitMax->Draw("SAME");
             }
 
-
-            // ---- Info box on pad 3 (matching auau3D) ----
+            // Info box (similar to SMASH)
             cSample->cd(3);
             TPaveText* infoS = new TPaveText(0.55, 0.55, 0.89, 0.89, "NDC");
             infoS->SetBorderSize(0);
             infoS->SetFillStyle(0);
             infoS->SetTextSize(0.035);
-            infoS->AddText(Form("#alpha = %.3f #pm %.3f", alpha_vals[j], alpha_err_vals[j]));
-            infoS->AddText(Form("R_{out} = %.2f #pm %.2f fm", Rout_vals[j], Rout_err_vals[j]));
-            infoS->AddText(Form("R_{side} = %.2f #pm %.2f fm", Rside_vals[j], Rside_err_vals[j]));
-            infoS->AddText(Form("R_{long} = %.2f #pm %.2f fm", Rlong_vals[j], Rlong_err_vals[j]));
-            infoS->AddText(Form("#lambda = %.3f #pm %.3f", lam_vals[j], lam_err_vals[j]));
-            infoS->AddText(Form("-logL/NDF: %.2f/%.0f", logL_vals[j], ndf_vals[j]));
+            infoS->AddText(Form("#alpha = %.3f #pm %.3f", alpha_vals[idx], alpha_err_vals[idx]));
+            infoS->AddText(Form("R_{out} = %.2f #pm %.2f fm", Rout_vals[idx], Rout_err_vals[idx]));
+            infoS->AddText(Form("R_{side} = %.2f #pm %.2f fm", Rside_vals[idx], Rside_err_vals[idx]));
+            infoS->AddText(Form("R_{long} = %.2f #pm %.2f fm", Rlong_vals[idx], Rlong_err_vals[idx]));
+            infoS->AddText(Form("#lambda = %.3f #pm %.3f",
+                                lambda_by_cutoff["1mm"][idx],
+                                lambda_err_by_cutoff["1mm"][idx]));
+            infoS->AddText(Form("-logL/NDF: %.2f/%.0f", logL_vals[idx], ndf_vals[idx]));
             infoS->Draw();
 
-
-            // ---- System info on pad 1 (matching auau3D) ----
             cSample->cd(1);
             TPaveText* infoSys = new TPaveText(0.55, 0.55, 0.89, 0.89, "NDC");
             infoSys->SetBorderSize(0);
@@ -547,118 +673,112 @@ for (int ibin = 0; ibin < nBins_kT; ibin++) {
             infoSys->AddText(Form("N_{pairs} = %d", pair_count_per_bin[ibin]));
             infoSys->Draw();
 
-
-            cSample->SaveAs(Form("EPOS_Drho_kT%.2f_%.2f.png", kT_lo, kT_hi));
+            cSample->SaveAs(Form("EPOS_Drho_kT%.2f_%.2f_cutoff.png", kT_lo, kT_hi));
             delete cSample;
-            found = true;
-            break;
         }
+        cout << "\nSaved D(rho) canvases" << endl;
     }
-}
-cout << "\nSaved all D(rho) canvases" << endl;
 
+    // ============================================================
+    // mT vs fit parameters (4-pad) using 1mm cutoff lambda
+    // ============================================================
+    int nPoints2 = mt_vals.size();
+    if (nPoints2 >= 2) {
+        TCanvas* c_mT = new TCanvas("c_mT", "Fit Parameters vs m_T", 1600, 1200);
+        c_mT->Divide(2, 2);
 
-// ============================================================
-// mT vs fit parameters (4-pad, matching auau3D)
-// ============================================================
-int nPoints = mt_vals.size();
-if (nPoints >= 2) {
-    TCanvas* c_mT = new TCanvas("c_mT", "Fit Parameters vs m_T", 1600, 1200);
-    c_mT->Divide(2, 2);
+        vector<double> mt_e(nPoints2, 0.0);
 
+        // Pad 1: alpha
+        c_mT->cd(1);
+        TGraphErrors* gAlpha = new TGraphErrors(nPoints2,
+            &mt_vals[0], &alpha_vals[0],
+            &mt_e[0],    &alpha_err_vals[0]);
+        gAlpha->SetTitle("#alpha vs m_{T}; m_{T} [GeV/c^{2}]; #alpha");
+        gAlpha->SetMarkerStyle(20);
+        gAlpha->SetMarkerColor(kBlack);
+        gAlpha->GetHistogram()->GetYaxis()->SetRangeUser(0.5, 2.5);
+        gAlpha->Draw("AP");
 
-    vector<double> mt_e(nPoints, 0.0);
+        // Pad 2: Radii
+        c_mT->cd(2);
+        TGraphErrors* gRout = new TGraphErrors(nPoints2,
+            &mt_vals[0], &Rout_vals[0],
+            &mt_e[0],    &Rout_err_vals[0]);
+        gRout->SetMarkerStyle(21); gRout->SetMarkerColor(kRed);
+        gRout->SetLineColor(kRed);
+        gRout->SetTitle("HBT radii vs m_{T}; m_{T} [GeV/c^{2}]; R [fm]");
 
+        TGraphErrors* gRside = new TGraphErrors(nPoints2,
+            &mt_vals[0], &Rside_vals[0],
+            &mt_e[0],    &Rside_err_vals[0]);
+        gRside->SetMarkerStyle(22); gRside->SetMarkerColor(kBlue);
+        gRside->SetLineColor(kBlue);
 
-    // Pad 1: alpha vs mT
-    c_mT->cd(1);
-    TGraphErrors* gAlpha = new TGraphErrors(nPoints,
-        &mt_vals[0], &alpha_vals[0],
-        &mt_e[0],    &alpha_err_vals[0]);
-    gAlpha->SetTitle("#alpha vs m_{T}; m_{T} [GeV/c^{2}]; #alpha");
-    gAlpha->SetMarkerStyle(20);
-    gAlpha->SetMarkerColor(kBlack);
-    gAlpha->GetHistogram()->GetYaxis()->SetRangeUser(0.5, 2.5);
-    gAlpha->Draw("AP");
+        TGraphErrors* gRlong = new TGraphErrors(nPoints2,
+            &mt_vals[0], &Rlong_vals[0],
+            &mt_e[0],    &Rlong_err_vals[0]);
+        gRlong->SetMarkerStyle(23); gRlong->SetMarkerColor(kGreen+2);
+        gRlong->SetLineColor(kGreen+2);
 
+        gRout->GetHistogram()->GetYaxis()->SetRangeUser(0.5, 35.0);
+        gRout->Draw("AP");
+        gRside->Draw("P SAME");
+        gRlong->Draw("P SAME");
 
-    // Pad 2: Radii vs mT
-    c_mT->cd(2);
-    TGraphErrors* gRout = new TGraphErrors(nPoints,
-        &mt_vals[0], &Rout_vals[0],
-        &mt_e[0],    &Rout_err_vals[0]);
-    gRout->SetMarkerStyle(21); gRout->SetMarkerColor(kRed);
-    gRout->SetLineColor(kRed);
-    gRout->SetTitle("HBT radii vs m_{T}; m_{T} [GeV/c^{2}]; R [fm]");
+        TLegend* legR = new TLegend(0.65, 0.70, 0.88, 0.88);
+        legR->SetBorderSize(0); legR->SetFillStyle(0);
+        legR->AddEntry(gRout,  "R_{out}",  "P");
+        legR->AddEntry(gRside, "R_{side}", "P");
+        legR->AddEntry(gRlong, "R_{long}", "P");
+        legR->Draw();
 
+        // Pad 3: lambda (1mm cutoff)
+        c_mT->cd(3);
+        // Extract 1mm lambda values (must exist)
+        const auto& lam1mm = lambda_by_cutoff["1mm"];
+        const auto& lam1mmErr = lambda_err_by_cutoff["1mm"];
+        if (lam1mm.size() == nPoints2) {
+            TGraphErrors* gLambda = new TGraphErrors(nPoints2,
+                &mt_vals[0], &lam1mm[0],
+                &mt_e[0],    &lam1mmErr[0]);
+            gLambda->SetTitle("#lambda_{1mm} vs m_{T}; m_{T} [GeV/c^{2}]; #lambda");
+            gLambda->SetMarkerStyle(20); gLambda->SetMarkerColor(kBlack);
+            gLambda->Draw("AP");
+        } else {
+            TPaveText* warn = new TPaveText(0.15, 0.45, 0.85, 0.60, "NDC");
+            warn->SetBorderSize(0); warn->SetFillStyle(0);
+            warn->AddText("Incomplete #lambda results for 1mm");
+            warn->Draw();
+        }
 
-    TGraphErrors* gRside = new TGraphErrors(nPoints,
-        &mt_vals[0], &Rside_vals[0],
-        &mt_e[0],    &Rside_err_vals[0]);
-    gRside->SetMarkerStyle(22); gRside->SetMarkerColor(kBlue);
-    gRside->SetLineColor(kBlue);
+        // Pad 4: system info
+        c_mT->cd(4);
+        gPad->SetFillColor(0); gPad->SetFrameBorderMode(0);
+        TPaveText* sysInfo = new TPaveText(0.10, 0.10, 0.90, 0.90, "NDC");
+        sysInfo->SetTextSize(0.045); sysInfo->SetFillColor(0);
+        sysInfo->SetBorderSize(1); sysInfo->SetTextFont(42); sysInfo->SetTextAlign(12);
+        sysInfo->AddText("System Information");
+        sysInfo->AddText("---------------------------");
+        sysInfo->AddText("EPOS Au+Au 0-5%");
+        sysInfo->AddText("#sqrt{s_{NN}} = 200 GeV");
+        sysInfo->AddText(" ");
+        sysInfo->AddText(Form("N_{events} = %d", nEvents));
+        sysInfo->AddText(Form("Total pairs: %lld", total_pairs_all));
+        sysInfo->AddText(Form("kT bins with fits: %d / %d", nPoints2, nBins_kT));
+        sysInfo->AddText(" ");
+        sysInfo->AddText("Kinematic cuts:");
+        sysInfo->AddText(Form("%.2f < p_{T} < %.2f GeV/c", pT_min, pT_max));
+        sysInfo->AddText(Form("|#eta| < %.1f", eta_cut));
+        sysInfo->AddText(" ");
+        sysInfo->AddText("EPOS ID: #pi^{+} = 120, #pi^{-} = -120");
+        sysInfo->AddText("ist = 0 (final state)");
+        sysInfo->Draw();
 
+        c_mT->SaveAs("EPOS_mT_params_cutoff.png");
+        cout << "\nSaved: EPOS_mT_params_cutoff.png" << endl;
+    }
 
-    TGraphErrors* gRlong = new TGraphErrors(nPoints,
-        &mt_vals[0], &Rlong_vals[0],
-        &mt_e[0],    &Rlong_err_vals[0]);
-    gRlong->SetMarkerStyle(23); gRlong->SetMarkerColor(kGreen+2);
-    gRlong->SetLineColor(kGreen+2);
-
-
-    gRout->GetHistogram()->GetYaxis()->SetRangeUser(0.5, 35.0);
-    gRout->Draw("AP");
-    gRside->Draw("P SAME");
-    gRlong->Draw("P SAME");
-
-
-    TLegend* legR = new TLegend(0.65, 0.70, 0.88, 0.88);
-    legR->SetBorderSize(0); legR->SetFillStyle(0);
-    legR->AddEntry(gRout,  "R_{out}",  "P");
-    legR->AddEntry(gRside, "R_{side}", "P");
-    legR->AddEntry(gRlong, "R_{long}", "P");
-    legR->Draw();
-
-
-    // Pad 3: lambda vs mT
-    c_mT->cd(3);
-    TGraphErrors* gLambda = new TGraphErrors(nPoints,
-        &mt_vals[0], &lam_vals[0],
-        &mt_e[0],    &lam_err_vals[0]);
-    gLambda->SetTitle("#lambda vs m_{T}; m_{T} [GeV/c^{2}]; #lambda");
-    gLambda->SetMarkerStyle(20); gLambda->SetMarkerColor(kBlack);
-    gLambda->Draw("AP");
-
-
-    // Pad 4: system information
-    c_mT->cd(4);
-    gPad->SetFillColor(0); gPad->SetFrameBorderMode(0);
-    TPaveText* sysInfo = new TPaveText(0.10, 0.10, 0.90, 0.90, "NDC");
-    sysInfo->SetTextSize(0.045); sysInfo->SetFillColor(0);
-    sysInfo->SetBorderSize(1); sysInfo->SetTextFont(42); sysInfo->SetTextAlign(12);
-    sysInfo->AddText("System Information");
-    sysInfo->AddText("---------------------------");
-    sysInfo->AddText("EPOS Au+Au 0-5%");
-    sysInfo->AddText("#sqrt{s_{NN}} = 200 GeV");
-    sysInfo->AddText(" ");
-    sysInfo->AddText(Form("N_{events} = %d", nEvents));
-    sysInfo->AddText(Form("Total pairs: %lld", total_pairs_all));
-    sysInfo->AddText(Form("kT bins with fits: %d / %d", nPoints, nBins_kT));
-    sysInfo->AddText(" ");
-    sysInfo->AddText("Kinematic cuts:");
-    sysInfo->AddText(Form("%.2f < p_{T} < %.2f GeV/c", pT_min, pT_max));
-    sysInfo->AddText(Form("|#eta| < %.1f", eta_cut));
-    sysInfo->AddText(" ");
-    sysInfo->AddText("EPOS ID: #pi^{+} = 120, #pi^{-} = -120");
-    sysInfo->AddText("ist = 0 (final state)");
-    sysInfo->Draw();
-
-
-    c_mT->SaveAs("EPOS_mT_params_robust.png");
-    cout << "\nSaved: EPOS_mT_params_robust.png" << endl;
-}
-
-
-sw.Stop();
-sw.Print();
+    sw.Stop();
+    sw.Print();
 }
