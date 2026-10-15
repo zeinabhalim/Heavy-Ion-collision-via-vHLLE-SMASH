@@ -1,11 +1,3 @@
-// ============================================================
-// EPOS Au+Au 200 GeV analysis - 3D Levy fits with cutoff loop
-//   * on-shell pion energy (the 'e' branch is NOT the energy)
-//   * Poisson deviance on RAW COUNTS, normalised to the full
-//     source up to rho_max^lambda (so lambda depends on the cutoff)
-//   * integrated bin prediction (Simpson), core-only fit range
-// Run:  root -l -b -q epos_hbt_3D_robust.C
-// ============================================================
 #include <TFile.h>
 #include <TTree.h>
 #include <TChain.h>
