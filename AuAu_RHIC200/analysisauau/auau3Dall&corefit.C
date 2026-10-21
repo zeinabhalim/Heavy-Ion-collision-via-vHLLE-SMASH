@@ -18,7 +18,7 @@
 #include <sstream>
 #include <iomanip>
 #include <TRandom3.h>
-#include <algorithm>       // Fix 5: std::min_element / std::max_element
+#include <algorithm>
 #include "Levy_proj_reader.h"
 
 #include <TLorentzVector.h>
@@ -28,7 +28,7 @@
 #include <Math/Factory.h>
 #include <Math/Functor.h>
 #include <cmath>
-#include <limits>          // std::numeric_limits
+#include <limits>
 
 using namespace std;
 
@@ -39,52 +39,35 @@ Levy_reader* myLevy_reader;
 // ===============================
 double LevyProj1DFunc(const double *x, const double *par)
 {
-    double alpha = par[0];
-    double R     = par[1];
+    double alpha  = par[0];
+    double R      = par[1];
     double lambda = par[2];
-
-    double Rcc = R * pow(2., 1./alpha);
-
+    double Rcc    = R * pow(2., 1./alpha);
     return (2.*lambda / Rcc) * myLevy_reader->getValue_1d(alpha, x[0]/Rcc);
 }
 
-//
-// ================================================================
-// Integrate the Levy source over one histogram bin.
-// ================================================================
-double IntegralLevyBin(
-    double alpha,
-    double R,
-    double lambda,
-    double xlow,
-    double xhigh)
+double IntegralLevyBin(double alpha, double R, double lambda,
+                       double xlow, double xhigh)
 {
     const int nsub = 8;
+    if (xhigh <= xlow) return 0.0;
 
-    if (xhigh <= xlow)
-        return 0.0;
-
-    const double dx =
-        (xhigh - xlow) / static_cast<double>(nsub);
-
+    const double dx = (xhigh - xlow) / static_cast<double>(nsub);
     double sum = 0.0;
-
     for (int k = 0; k <= nsub; ++k) {
-
         const double x = xlow + k * dx;
-
         const double pars[3] = { alpha, R, lambda };
-
         double weight;
         if (k == 0 || k == nsub) weight = 1.0;
         else if (k % 2 == 1)     weight = 4.0;
         else                     weight = 2.0;
-
         sum += weight * LevyProj1DFunc(&x, pars);
     }
-
     return sum * dx / 3.0;
 }
+
+// forward declaration (definition is below)
+int CountFitBins(TH1* h, double fitMin, double fitMax);
 
 // ===============================
 // Particle structure
@@ -99,8 +82,11 @@ struct Particle {
     Double_t x,  y,  z,  t;
     Double_t xf, yf, zf, tf;
     Double_t time_last_coll;
-    Int_t   proc_type;
-    Int_t proc_id_origin;
+    Int_t    ncoll = 0;
+    Double_t form_time = 0.0;
+    int emissionOrigin = 0;   // 0 = default, 1 = history, 2 = eta fallback, 3 = weak forced
+    Int_t    proc_type;
+    Int_t    proc_id_origin;
 
     Double_t mass() const { return sqrt(E*E - (px*px + py*py + pz*pz)); }
     Double_t pt()   const { return sqrt(px*px + py*py); }
@@ -117,14 +103,9 @@ struct Particle {
     Int_t historyParentPDG = 0;
     Double_t productionX = 0.0, productionY = 0.0, productionZ = 0.0, productionT = 0.0;
     bool hasHistoryProductionVertex = false;
-
-    // Fix 4: a flag that marks particles whose (xf,yf,zf,tf) is set
-    // explicitly at construction (e.g. eta daughters). These points
-    // must not be re-derived by assignEmissionPoint().
-    bool hasExplicitEmissionPoint = false;
+    bool hasExplicitEmissionPoint   = false;
 
     Float_t pT() const { return TMath::Sqrt(px*px + py*py); }
-
     Float_t eta() const {
         Float_t p_abs = p();
         if (p_abs <= fabs(pz)) return (pz > 0 ? 999.0 : -999.0);
@@ -132,9 +113,6 @@ struct Particle {
     }
 };
 
-// ===============================
-// ParticleKey / ProductionInfo
-// ===============================
 struct ParticleKey {
     int event    = -1;
     int ensemble = 0;
@@ -148,9 +126,9 @@ struct ParticleKey {
 ParticleKey MakeKey(const Particle& p)
 {
     ParticleKey k;
-    k.event = p.event_id;
+    k.event    = p.event_id;
     k.ensemble = p.ensemble_id;
-    k.id = p.ID;
+    k.id       = p.ID;
     return k;
 }
 
@@ -160,30 +138,6 @@ struct ProductionInfo {
     double x = 0.0, y = 0.0, z = 0.0, t = 0.0;
 };
 
-bool isLongLivedParent(int pdg) {
-    pdg = std::abs(pdg);
-    return (pdg == 3122 ||
-            pdg == 3222 || pdg == 3212 || pdg == 3112 ||
-            pdg == 310  ||
-            pdg == 411  || pdg == 421 || pdg == 431);
-}
-
-bool hasLongLivedAncestor(const Particle& p,
-                         const std::map<int,const Particle*>& particleByID)
-{
-    for (int mid : {p.mom1, p.mom2}) {
-        if (mid == 0) continue;
-        auto it = particleByID.find(mid);
-        if (it == particleByID.end()) continue;
-        const Particle* parent = it->second;
-        int pdg = std::abs(parent->pid);
-        if (isLongLivedParent(pdg)) return true;
-        if (hasLongLivedAncestor(*parent, particleByID))
-            return true;
-    }
-    return false;
-}
-
 enum class SourceType { Direct, Core, Halo };
 
 bool isHaloParent(int pdg)
@@ -192,7 +146,8 @@ bool isHaloParent(int pdg)
     return (pdg == 221  || pdg == 331  || pdg == 3122 || pdg == 310  ||
             pdg == 321  || pdg == 311  || pdg == 130  || pdg == 3222 ||
             pdg == 3212 || pdg == 3112 || pdg == 411  || pdg == 421  ||
-            pdg == 431  || pdg == 111);
+            pdg == 431  || pdg == 111  ||
+            pdg == 3322 || pdg == 3312 || pdg == 3334);
 }
 
 bool isCoreParent(int pdg)
@@ -202,7 +157,8 @@ bool isCoreParent(int pdg)
             pdg == 323  || pdg == 223  || pdg == 333);
 }
 
-int chooseOneParent(const Particle& p) {
+int chooseOneParent(const Particle& p)
+{
     int m1 = std::abs(p.mom1);
     int m2 = std::abs(p.mom2);
     if (m1 != 0 || m2 != 0) {
@@ -218,28 +174,18 @@ int chooseOneParent(const Particle& p) {
     return 0;
 }
 
-int findOriginalParent(const Particle& p,
-                       const std::map<int,const Particle*>& particleByID)
+int findOriginalParent(const Particle& p)
 {
-    int m1 = p.mom1;
-    int m2 = p.mom2;
-    for (int mid : {m1, m2}) {
-        if (mid == 0) continue;
-        auto it = particleByID.find(mid);
-        if (it == particleByID.end()) continue;
-        const Particle* parent = it->second;
-        int pdg = std::abs(parent->pid);
-        if (isHaloParent(pdg)) return pdg;
-        int higher = findOriginalParent(*parent, particleByID);
-        if (higher != 0) return higher;
-    }
+    if (p.hasHistoryProductionVertex && p.historyParentPDG != 0)
+        return std::abs(p.historyParentPDG);
+    if (p.mom1 != 0) return std::abs(p.mom1);
+    if (p.mom2 != 0) return std::abs(p.mom2);
     return 0;
 }
 
-SourceType classifyPionSource(const Particle& p,
-                              const std::map<int,const Particle*>& particleByID)
+SourceType classifyPionSource(const Particle& p)
 {
-    int parent = findOriginalParent(p, particleByID);
+    int parent = findOriginalParent(p);
     if (parent == 0) return SourceType::Direct;
     if (isHaloParent(parent)) return SourceType::Halo;
     return SourceType::Core;
@@ -248,12 +194,11 @@ SourceType classifyPionSource(const Particle& p,
 struct SourceStats {
     std::map<int,int> parentCounts;
     int direct = 0;
-    int core = 0;
-    int halo = 0;
+    int core   = 0;
+    int halo   = 0;
 };
 
-SourceStats CountPionSources(const std::vector<Particle>& particles,
-                             const std::map<int,const Particle*>&)
+SourceStats CountPionSources(const std::vector<Particle>& particles)
 {
     SourceStats stats;
     for (const auto& p : particles) {
@@ -262,18 +207,20 @@ SourceStats CountPionSources(const std::vector<Particle>& particles,
         if (parent == 0) { stats.direct++; continue; }
         stats.parentCounts[parent]++;
         if (isHaloParent(parent)) stats.halo++;
-        else stats.core++;
+        else                      stats.core++;
     }
     return stats;
 }
 
-//Filling from oscar file
+// ---------------------------
+// OSCAR loader
+// ---------------------------
 vector<Particle> LoadOSCAR(const char* fname)
 {
     vector<Particle> particles;
     ifstream fin(fname);
     string line;
-    int event_id = -1;
+    int event_id    = -1;
     int ensemble_id = 0;
 
     while (getline(fin, line))
@@ -282,10 +229,10 @@ vector<Particle> LoadOSCAR(const char* fname)
             if (line.find("event") != string::npos) {
                 stringstream ss(line);
                 string tok;
-                event_id = -1;
+                event_id    = -1;
                 ensemble_id = 0;
                 while (ss >> tok) {
-                    if (tok == "event") ss >> event_id;
+                    if (tok == "event")         ss >> event_id;
                     else if (tok == "ensemble") ss >> ensemble_id;
                 }
             }
@@ -296,15 +243,10 @@ vector<Particle> LoadOSCAR(const char* fname)
         Particle p;
         double mass, p0;
         int pdg, ID, charge, ncoll;
-        double form_time;
-        double time_last_coll;
-        double xsecfac;
-        int proc_id_origin;
-        int proc_type_origin;
-        int pdg_mother1;
-        int pdg_mother2;
-        int baryon_number;
-        int strangeness;
+        double form_time, time_last_coll, xsecfac;
+        int proc_id_origin, proc_type_origin;
+        int pdg_mother1, pdg_mother2;
+        int baryon_number, strangeness;
 
         ss >> p.t >> p.x >> p.y >> p.z
            >> mass >> p0
@@ -318,23 +260,21 @@ vector<Particle> LoadOSCAR(const char* fname)
 
         if (ss.fail()) continue;
 
-        p.pid = pdg;
-        p.ID = ID;
-        p.charge = charge;
-        p.event_id = event_id;
-        p.ensemble_id = ensemble_id;
-        p.proc_type = proc_type_origin;
+        p.pid            = pdg;
+        p.ID             = ID;
+        p.charge         = charge;
+        p.event_id       = event_id;
+        p.ensemble_id    = ensemble_id;
+        p.proc_type      = proc_type_origin;
         p.proc_id_origin = proc_id_origin;
-        p.mom1 = pdg_mother1;
-        p.mom2 = pdg_mother2;
+        p.mom1           = pdg_mother1;
+        p.mom2           = pdg_mother2;
         p.time_last_coll = time_last_coll;
+        p.ncoll          = ncoll;
+        p.form_time      = form_time;
 
-        
-//const double m_pi = 0.13957;
-                    //double pp  = sqrt(p.px*p.px + p.py*p.py + p.pz*p.pz);
-       double p2 = p.px*p.px + p.py*p.py + p.pz*p.pz;
+        double p2 = p.px*p.px + p.py*p.py + p.pz*p.pz;
         p.E = sqrt(p2 + mass*mass);
-                   // p.E  = sqrt(pp*pp + m_pi*m_pi); 
 
         particles.push_back(p);
     }
@@ -343,9 +283,9 @@ vector<Particle> LoadOSCAR(const char* fname)
     return particles;
 }
 
-// ============================================================================
-// History parser from hadron afterbyrner
-// ============================================================================
+// ===============================
+// History parser
+// ===============================
 struct HistoryLine {
     double t=0, x=0, y=0, z=0, mass=0, p0=0, px=0, py=0, pz=0;
     int pdg=0, ID=0, charge=0, ncoll=0;
@@ -369,7 +309,7 @@ static bool ParseHistoryLine(const std::string& line, HistoryLine& hp)
 }
 
 void LoadDecayVertices(const char* fname,
-                        std::map<ParticleKey, ProductionInfo>& productionMap)
+                       std::map<ParticleKey, ProductionInfo>& productionMap)
 {
     std::ifstream fin(fname);
     if (!fin.is_open()) {
@@ -378,7 +318,7 @@ void LoadDecayVertices(const char* fname,
     }
 
     std::string line;
-    int event_id = -1;
+    int event_id    = -1;
     int ensemble_id = 0;
 
     bool inBlock = false;
@@ -396,7 +336,7 @@ void LoadDecayVertices(const char* fname,
                 std::stringstream ss(line);
                 std::string tok;
                 while (ss >> tok) {
-                    if (tok == "event") ss >> event_id;
+                    if (tok == "event")         ss >> event_id;
                     else if (tok == "ensemble") ss >> ensemble_id;
                 }
                 inBlock = false;
@@ -407,7 +347,7 @@ void LoadDecayVertices(const char* fname,
                 std::string tok;
                 nIn = 0; nOut = 0;
                 while (ss >> tok) {
-                    if (tok == "in") ss >> nIn;
+                    if (tok == "in")       ss >> nIn;
                     else if (tok == "out") ss >> nOut;
                 }
                 incoming.clear();
@@ -440,7 +380,7 @@ void LoadDecayVertices(const char* fname,
             } else {
                 int candidatePDG = hp.pdg_mother1 != 0 ? hp.pdg_mother1 : hp.pdg_mother2;
                 info.parentPDG = candidatePDG;
-                info.parentID = 0;
+                info.parentID  = 0;
                 int nMatches = 0;
                 for (const auto& in_p : incoming)
                     if (in_p.pdg == candidatePDG) { info.parentID = in_p.ID; nMatches++; }
@@ -459,7 +399,7 @@ void LoadDecayVertices(const char* fname,
 }
 
 void MatchHistoryVertices(std::vector<Particle>& particles,
-                           const std::map<ParticleKey, ProductionInfo>& productionMap)
+                          const std::map<ParticleKey, ProductionInfo>& productionMap)
 {
     int matched = 0;
     for (auto& p : particles) {
@@ -483,15 +423,15 @@ void MatchHistoryVertices(std::vector<Particle>& particles,
 // Configuration
 // =========================================
 const char* collision_system = "Au+Au";
-const char* centrality = "0-5%";
+const char* centrality       = "0-5%";
 double sqrt_sNN = 200;
 
-double pT_min = 0.15;
-double pT_max = 1.0;
+double pT_min  = 0.15;
+double pT_max  = 1.0;
 double eta_cut = 1.0;
 
 // ===============================
-// HBTResults structure
+// HBTResults
 // ===============================
 struct HBTResults {
     TH1F* hOut;
@@ -501,110 +441,84 @@ struct HBTResults {
     int total_pairs;
 };
 
-// ===============================
-// Analyze pairs
-// ===============================
-HBTResults AnalyzePairs(const std::vector<Particle>& particles,
-                        const std::map<int,const Particle*>& particleByID,
+/*HBTResults AnalyzePairs(const std::vector<Particle>& particles,
                         double kT_min,
                         double kT_max,
                         bool useCoreOnly = false)
 {
     std::map<int, std::vector<Particle>> events;
-
     for (const auto& p : particles) {
         if (std::abs(p.pid) != 211) continue;
-        if (useCoreOnly && classifyPionSource(p, particleByID) == SourceType::Halo)
+        if (useCoreOnly && classifyPionSource(p) == SourceType::Halo)
             continue;
         events[p.event_id].push_back(p);
     }
 
     const int n_bins = 300;
-
     const double rho_min = 0.1;
     const double rho_max = 1.0e15;
-
     double bins[n_bins + 1];
-
     const double logStep = std::pow(rho_max / rho_min, 1.0 / n_bins);
-
     bins[0] = rho_min;
-    for (int i = 1; i <= n_bins; ++i)
-        bins[i] = bins[i - 1] * logStep;
+    for (int i = 1; i <= n_bins; ++i) bins[i] = bins[i-1] * logStep;
 
     TH1F* hRho  = new TH1F("hRho",  "D(#rho)", n_bins, bins);
     TH1F* hOut  = new TH1F("hOut",  "", n_bins, bins);
     TH1F* hSide = new TH1F("hSide", "", n_bins, bins);
     TH1F* hLong = new TH1F("hLong", "", n_bins, bins);
-
-    hRho->Sumw2();
-    hOut->Sumw2();
-    hSide->Sumw2();
-    hLong->Sumw2();
+    hRho->Sumw2(); hOut->Sumw2(); hSide->Sumw2(); hLong->Sumw2();
 
     int pairs_count = 0;
-
     for (auto& ev : events) {
         const auto& v = ev.second;
-
         for (size_t i = 0; i < v.size(); ++i) {
             const Particle& p1 = v[i];
-
             if (p1.pT() < pT_min || p1.pT() > pT_max) continue;
             if (fabs(p1.eta()) > eta_cut) continue;
 
             for (size_t j = i + 1; j < v.size(); ++j) {
                 const Particle& p2 = v[j];
-
                 if (p2.pT() < pT_min || p2.pT() > pT_max) continue;
                 if (fabs(p2.eta()) > eta_cut) continue;
-
                 if (p1.pid != p2.pid) continue;
 
                 double kx = 0.5 * (p1.px + p2.px);
                 double ky = 0.5 * (p1.py + p2.py);
                 double kz = 0.5 * (p1.pz + p2.pz);
                 double kT = TMath::Sqrt(kx*kx + ky*ky);
-
-                //if (kT < kT_min || kT > kT_max) continue;
                 if (kT < kT_min || kT >= kT_max) continue;
-               if (!(kT > 0.0)  || !std::isfinite(kT)) continue;
+                if (!(kT > 0.0) || !std::isfinite(kT)) continue;
 
-                double mpi = 0.13957;
-                double mT = sqrt(kT*kT + mpi*mpi);
+                const double mpi = 0.13957;
+                double mT    = sqrt(kT*kT + mpi*mpi);
                 double qmCut = sqrt(0.2 * mT);
 
-                double qx = p1.px - p2.px;
-                double qy = p1.py - p2.py;
-                double qzL = (4*pow((p1.pz*p2.E - p2.pz*p1.E),2)) /
-                             (pow((p1.E+p2.E),2) - pow((p1.pz+p2.pz),2));
+                double qx    = p1.px - p2.px;
+                double qy    = p1.py - p2.py;
+                double qzL   = (4*pow((p1.pz*p2.E - p2.pz*p1.E),2)) /
+                               (pow((p1.E+p2.E),2) - pow((p1.pz+p2.pz),2));
                 double qLCMS = TMath::Sqrt(qx*qx + qy*qy + qzL);
-
                 if (qLCMS > qmCut) continue;
-
-                pairs_count++;
 
                 double dx = p1.xf - p2.xf;
                 double dy = p1.yf - p2.yf;
                 double dz = p1.zf - p2.zf;
                 double dt = p1.tf - p2.tf;
 
-                double K0 = 0.5 * (p1.E + p2.E);
-                double kp = K0*K0 - kz*kz;
+                double K0  = 0.5 * (p1.E + p2.E);
+                double kp  = K0*K0 - kz*kz;
                 double phi = atan2(ky, kx);
-                
                 if (!(kp > 0.0) || !std::isfinite(kp)) continue;
 
-                double r_out  = TMath::Cos(phi) * dx + TMath::Sin(phi) * dy
-                              - (kT/kp) * (K0*dt - kz*dz);
-                double r_side = -TMath::Sin(phi) * dx + TMath::Cos(phi) * dy;
+                double r_out  = TMath::Cos(phi)*dx + TMath::Sin(phi)*dy
+                              - (kT/kp)*(K0*dt - kz*dz);
+                double r_side = -TMath::Sin(phi)*dx + TMath::Cos(phi)*dy;
                 double r_long = (K0*dz - kz*dt) / sqrt(kp);
-
-                double rho = sqrt(r_out*r_out + r_side*r_side + r_long*r_long);
-                
+                double rho    = sqrt(r_out*r_out + r_side*r_side + r_long*r_long);
                 if (!std::isfinite(r_out) || !std::isfinite(r_side) ||
-                  !std::isfinite(r_long) || !std::isfinite(rho)) continue;
+                    !std::isfinite(r_long) || !std::isfinite(rho)) continue;
 
+                pairs_count++;
 
                 hRho->Fill(rho);
                 hOut->Fill(fabs(r_out));
@@ -615,15 +529,14 @@ HBTResults AnalyzePairs(const std::vector<Particle>& particles,
     }
 
     HBTResults res;
-    res.hOut = hOut;
-    res.hSide = hSide;
-    res.hLong = hLong;
-    res.hRho = hRho;
-    res.total_pairs = pairs_count;
-
+    res.hOut = hOut; res.hSide = hSide; res.hLong = hLong;
+    res.hRho = hRho; res.total_pairs = pairs_count;
     return res;
-}
+}*/
 
+// ===============================
+// Source stats
+// ===============================
 void PrintSourceStats(const SourceStats& stats)
 {
     auto getCount = [&](int pdg) {
@@ -637,21 +550,14 @@ void PrintSourceStats(const SourceStats& stats)
     std::cout << "  eta' (331): "    << getCount(331)   << " pions\n";
     std::cout << "  Lambda (3122): "  << getCount(3122)  << " pions\n";
     std::cout << "  K0S (310): "      << getCount(310)   << " pions\n";
-    std::cout << "  omega (223): "    << getCount(223)   << " pions\n";
-    std::cout << "  phi (333): "      << getCount(333)   << " pions\n";
-    std::cout << "  D+ (411): "       << getCount(411)   << " pions\n";
-    std::cout << "  D0 (421): "       << getCount(421)   << " pions\n";
-    std::cout << "  Ds (431): "       << getCount(431)   << " pions\n";
-    std::cout << "  rho0 (113): "     << getCount(113)   << " pions\n";
-    std::cout << "  Delta++ (2224): "  << getCount(2224)  << " pions\n";
-    std::cout << "  K*0 (313): "      << getCount(313)   << " pions\n";
-    std::cout << "  Sigma+ (3222): "   << getCount(3222)  << " pions\n";
-    std::cout << "  rho+ (213): "     << getCount(213)   << " pions\n";
-    std::cout << "  K*+ (323): "      << getCount(323)   << " pions\n";
+    std::cout << "  K0 (311): "       << getCount(311)   << " pions\n";
+    std::cout << "  K_L (130): "      << getCount(130)   << " pions\n";
+    std::cout << "  Sigma+ (3222): "  << getCount(3222)  << " pions\n";
     std::cout << "  Sigma- (3112): "  << getCount(3112)  << " pions\n";
     std::cout << "  Sigma0 (3212): "  << getCount(3212)  << " pions\n";
-    std::cout << "  K0 (311): "       << getCount(311)   << "\n";
-    std::cout << "  K_L (130): "      << getCount(130)   << "\n";
+    std::cout << "  Xi0 (3322): "     << getCount(3322)  << " pions\n";
+    std::cout << "  Xi- (3312): "     << getCount(3312)  << " pions\n";
+    std::cout << "  Omega- (3334): "  << getCount(3334)  << " pions\n";
     std::cout << "  direct pions: "   << stats.direct    << "\n";
     std::cout << "  core pions: "     << stats.core      << "\n";
     std::cout << "  halo pions: "     << stats.halo      << "\n";
@@ -661,33 +567,21 @@ void PrintSourceStats(const SourceStats& stats)
               << (total > 0 ? double(stats.halo) / total : 0.0) << "\n";
 }
 
-//reading particles decay info. from smash input txt files
-struct ParticleInfo {
-    std::string name;
-    double mass;
-    double width;
-    std::vector<int> pdgs;
-};
-
-struct DecayChannel {
-    double br;
-    int L;
-    std::vector<std::string> daughters;
-};
+// ===============================
+// Particle/decay tables
+// ===============================
+struct ParticleInfo { std::string name; double mass; double width; std::vector<int> pdgs; };
+struct DecayChannel { double br; int L; std::vector<std::string> daughters; };
 
 std::unordered_map<int, std::vector<DecayChannel>> decayTable;
 std::unordered_map<int, ParticleInfo> particleTable;
 std::unordered_map<std::string, int> nameToPDG;
 
-// ============================================================
-// Global map: parent PDG -> median simulated emission radius
-// ============================================================
 std::map<int, double> gParentMedianEmission;
 
 void ComputeParentMedianEmission(const std::vector<Particle>& particles)
 {
     std::map<int, std::vector<double>> buckets;
-
     for (const auto& p : particles) {
         if (std::abs(p.pid) != 211) continue;
 
@@ -696,7 +590,6 @@ void ComputeParentMedianEmission(const std::vector<Particle>& particles)
         else if (p.mom1 != 0)          pdg = std::abs(p.mom1);
         else if (p.mom2 != 0)          pdg = std::abs(p.mom2);
         if (pdg == 0) continue;
-
         if (!isHaloParent(pdg)) continue;
 
         double r = std::sqrt(p.xf*p.xf + p.yf*p.yf + p.zf*p.zf);
@@ -717,39 +610,30 @@ void ComputeParentMedianEmission(const std::vector<Particle>& particles)
 void LoadParticleTable(const std::string& filename)
 {
     std::ifstream fin(filename);
-
     if (!fin.is_open()) {
         std::cerr << "Cannot open " << filename << std::endl;
         return;
     }
 
     std::string line;
-
     while (std::getline(fin, line)) {
-
         size_t commentPos = line.find('#');
         if (commentPos != std::string::npos)
             line = line.substr(0, commentPos);
-
         if (line.empty()) continue;
 
         std::stringstream ss(line);
-
-        std::string name;
+        std::string name, parity;
         double mass, width;
-        std::string parity;
-
         ss >> name >> mass >> width >> parity;
-
         if (ss.fail()) continue;
 
         ParticleInfo info;
-        info.name = name;
-        info.mass = mass;
+        info.name  = name;
+        info.mass  = mass;
         info.width = width;
 
         int pdg;
-
         while (ss >> pdg) {
             info.pdgs.push_back(pdg);
             particleTable[std::abs(pdg)] = info;
@@ -780,7 +664,6 @@ void LoadParticleTable(const std::string& filename)
 void LoadDecayModes(const std::string& filename)
 {
     std::ifstream fin(filename);
-
     if (!fin.is_open()) {
         std::cerr << "Cannot open " << filename << std::endl;
         return;
@@ -788,18 +671,13 @@ void LoadDecayModes(const std::string& filename)
 
     std::string line;
     int currentParentPDG = 0;
-
     while (std::getline(fin, line)) {
-
         size_t commentPos = line.find('#');
         if (commentPos != std::string::npos)
             line = line.substr(0, commentPos);
-
         if (line.empty()) continue;
 
-        while (!line.empty() && isspace(line[0]))
-            line.erase(0,1);
-
+        while (!line.empty() && isspace(line[0])) line.erase(0,1);
         if (line.empty()) continue;
 
         if (!isdigit(line[0]) && line[0] != '.') {
@@ -807,31 +685,26 @@ void LoadDecayModes(const std::string& filename)
             std::string parentName;
             ss >> parentName;
             auto it = nameToPDG.find(parentName);
-            if (it != nameToPDG.end())
-                currentParentPDG = it->second;
-            else
-                currentParentPDG = 0;
+            currentParentPDG = (it != nameToPDG.end()) ? it->second : 0;
             continue;
         }
 
-        if (currentParentPDG == 0)
-            continue;
+        if (currentParentPDG == 0) continue;
 
         std::stringstream ss(line);
-
         DecayChannel ch;
         ss >> ch.br >> ch.L;
-
         std::string daughter;
-        while (ss >> daughter)
-            ch.daughters.push_back(daughter);
-
+        while (ss >> daughter) ch.daughters.push_back(daughter);
         decayTable[currentParentPDG].push_back(ch);
     }
 
     std::cout << "Loaded " << decayTable.size() << " decay blocks\n";
 }
 
+// ===============================
+// Lifetime helpers
+// ===============================
 constexpr double hbarc = 0.1973269804; // GeV fm
 TRandom3 rng(0);
 
@@ -840,8 +713,6 @@ double properLifetimeFmC(double widthGeV) {
     return hbarc / widthGeV;
 }
 
-// Fix 4: guarded version - returns -1 for nonpositive lifetimes so
-// the caller can reject the particle instead of using a sentinel.
 double sampleDecayProperTime(double tau0) {
     if (!(tau0 > 0.0)) return -1.0;
     return -tau0 * std::log(rng.Uniform());
@@ -855,40 +726,28 @@ double lifetimeFromPDG(int pdg) {
 }
 
 // ============================================================
-// Fix 4: emission-point hierarchy.
-//   1) Explicit vertex (eta daughters, etc.) -> keep as is.
-//   2) Matched history vertex -> keep as is.
-//   3) Halo sampling with a valid physical lifetime.
-//   4) Reject halo particles with no finite lifetime (do not
-//      place them at 1e25 fm).
-//   5) Back-propagate to time_last_coll for core/direct.
+// Emission-point hierarchy
 // ============================================================
-void assignEmissionPoint(Particle& p, int parentPDG, bool halo) {
+void assignEmissionPoint(Particle& p, int parentPDG, bool halo)
+{
+    if (p.hasExplicitEmissionPoint) return;
 
-    // (1) Explicit vertex already set by the caller.
-    if (p.hasExplicitEmissionPoint) {
-        return;
-    }
-
-    // (2) Matched history vertex.
     if (p.hasHistoryProductionVertex) {
         p.xf = p.productionX;
         p.yf = p.productionY;
         p.zf = p.productionZ;
         p.tf = p.productionT;
+        p.emissionOrigin = 1;
         return;
     }
 
-    // (3) Halo sampling with a finite, physical lifetime.
     if (halo) {
         double tau0 = lifetimeFromPDG(parentPDG);
-
         if (tau0 > 0.0) {
             double tauProper = sampleDecayProperTime(tau0);
             if (tauProper >= 0.0) {
                 double gamma = p.E / p.mass();
-                double dt = gamma * tauProper;
-
+                double dt    = gamma * tauProper;
                 p.xf = p.x + p.betaX() * dt;
                 p.yf = p.y + p.betaY() * dt;
                 p.zf = p.z + p.betaZ() * dt;
@@ -896,19 +755,25 @@ void assignEmissionPoint(Particle& p, int parentPDG, bool halo) {
                 return;
             }
         }
-
-        // (4) No finite lifetime available: fall through to core
-        // treatment rather than using the deleted 1e25 sentinel.
     }
 
-    // (5) Core / direct: back-propagate to time_last_coll.
-    double dt = p.t - p.time_last_coll;
+    // Core / direct back-propagation with the ncoll guard.
+    double tEmit = p.time_last_coll;
+    if (p.ncoll == 0 || !(tEmit > 0.0))
+        tEmit = std::max(p.time_last_coll, p.form_time);
+    if (!(tEmit > 0.0)) tEmit = p.t;
+    double dt = p.t - tEmit;
+    if (dt < 0.0) dt = 0.0;
+
     p.xf = p.x - p.betaX() * dt;
     p.yf = p.y - p.betaY() * dt;
     p.zf = p.z - p.betaZ() * dt;
-    p.tf = p.time_last_coll;
+    p.tf = p.t - dt;
 }
 
+// ===============================
+// Eta decay fallback
+// ===============================
 void DecayEtaParticles(const Particle& eta,
                        std::vector<Particle>& daughters,
                        int& nextID,
@@ -944,14 +809,12 @@ void DecayEtaParticles(const Particle& eta,
     if (!hasChargedPion) return;
     if (dmass.size() < 2 || dmass.size() > 3) return;
 
-    // Fix 4: if the eta has no finite lifetime, skip the decay rather
-    // than producing a huge sentinel displacement.
     double tau0 = lifetimeFromPDG(221);
     if (!(tau0 > 0.0)) return;
 
-    double tau  = -tau0 * log(gRandom->Rndm());
+    double tau   = -tau0 * log(gRandom->Rndm());
     double gamma = eta.E / eta.mass();
-    double dt = gamma * tau;
+    double dt    = gamma * tau;
 
     double dvx = eta.x + eta.betaX() * dt;
     double dvy = eta.y + eta.betaY() * dt;
@@ -967,12 +830,12 @@ void DecayEtaParticles(const Particle& eta,
                            (mEta*mEta - (m1-m2)*(m1-m2))) / (2.0 * mEta);
         double cosTheta = 2.0 * gRandom->Rndm() - 1.0;
         double sinTheta = sqrt(1.0 - cosTheta*cosTheta);
-        double phi = 2.0 * TMath::Pi() * gRandom->Rndm();
+        double phi      = 2.0 * TMath::Pi() * gRandom->Rndm();
         double e1 = sqrt(m1*m1 + p_cm*p_cm);
         double e2 = sqrt(m2*m2 + p_cm*p_cm);
-        p4_rest.push_back(TLorentzVector(p_cm*sinTheta*cos(phi),
-                                         p_cm*sinTheta*sin(phi),
-                                         p_cm*cosTheta, e1));
+        p4_rest.push_back(TLorentzVector( p_cm*sinTheta*cos(phi),
+                                          p_cm*sinTheta*sin(phi),
+                                          p_cm*cosTheta, e1));
         p4_rest.push_back(TLorentzVector(-p_cm*sinTheta*cos(phi),
                                          -p_cm*sinTheta*sin(phi),
                                          -p_cm*cosTheta, e2));
@@ -986,12 +849,10 @@ void DecayEtaParticles(const Particle& eta,
         for (int i = 0; i < 3; ++i)
             p4_rest.push_back(*event3.GetDecay(i));
     }
-
     if (p4_rest.size() != dmass.size()) return;
 
     TVector3 betaVec(eta.px/eta.E, eta.py/eta.E, eta.pz/eta.E);
-    for (size_t i = 0; i < dmass.size(); ++i)
-        p4_rest[i].Boost(betaVec);
+    for (size_t i = 0; i < dmass.size(); ++i) p4_rest[i].Boost(betaVec);
 
     for (size_t i = 0; i < dmass.size(); ++i) {
         Particle d;
@@ -1016,51 +877,155 @@ void DecayEtaParticles(const Particle& eta,
         d.pz = p4_rest[i].Pz();
         d.E  = p4_rest[i].E();
 
-        d.proc_type = eta.proc_type;
+        d.proc_type      = eta.proc_type;
         d.proc_id_origin = eta.proc_id_origin;
         d.time_last_coll = eta.time_last_coll;
+        d.form_time      = dvt;      // FIX 2b: fill form_time for injected daughters
 
         d.x = dvx; d.y = dvy; d.z = dvz; d.t = dvt;
         d.xf = dvx; d.yf = dvy; d.zf = dvz; d.tf = dvt;
 
-        // Fix 4: keep this explicitly-set vertex intact across the
-        // global emission-point pass.
         d.hasExplicitEmissionPoint = true;
-
+        d.emissionOrigin = 2;
         daughters.push_back(d);
     }
 }
 
-double TypicalEmissionLength(int pdg, double gammaAssumed = 2.0)
+// ============================================================
+// Weak-decay machinery
+// ============================================================
+struct WeakChannel  { double br; int a, b; };
+struct WeakSpecies  { double ctau_fm; std::vector<WeakChannel> ch; };
+static std::map<int, WeakSpecies> gWeak;
+
+static double WeakMass(int apdg)
 {
-    pdg = std::abs(pdg);
-    auto it = particleTable.find(pdg);
-    if (it == particleTable.end()) return 0.0;
-
-    double width = it->second.width;
-    if (width <= 0.0) return 0.0;
-
-    double ctau = hbarc / width;
-    return gammaAssumed * ctau;
+    switch (apdg) {
+        case 211:  return 0.13957; case 111:  return 0.13498;
+        case 321:  return 0.49368; case 310:  return 0.49761;
+        case 2212: return 0.93827; case 2112: return 0.93957;
+        case 3122: return 1.11568; case 3222: return 1.18937;
+        case 3212: return 1.19264; case 3112: return 1.19745;
+        case 3322: return 1.31486; case 3312: return 1.32171;
+        case 3334: return 1.67245; case 22:   return 0.0;
+    }
+    return -1.0;
 }
 
-int CountFitBins(
-    TH1* h,
-    double fitMin,
-    double fitMax)
+static bool IsWeakParent(int pdg)
 {
-    int count = 0;
+    const int a = std::abs(pdg);
+    return a==310 || a==311 || a==3122 || a==3222 || a==3212 ||
+           a==3112 || a==3322 || a==3312 || a==3334;
+}
 
-    for (int b = 1; b <= h->GetNbinsX(); ++b) {
-        const double x = h->GetBinCenter(b);
-        if (x >= fitMin && x <= fitMax) ++count;
+static int Conj(int pdg, bool anti)
+{
+    if (!anti || pdg == 111 || pdg == 22 || pdg == 310) return pdg;
+    return -pdg;
+}
+
+void InitWeakTable()
+{
+    const double cm = 1.0e13;
+    gWeak[310]  = { 2.6844*cm, { {0.692, 211,-211}, {0.307, 111,111} } };
+    gWeak[3122] = { 7.89*cm,   { {0.639, 2212,-211}, {0.358, 2112,111} } };
+    gWeak[3222] = { 2.404*cm,  { {0.5157,2212,111}, {0.4831,2112,211} } };
+    gWeak[3112] = { 4.434*cm,  { {0.99848,2112,-211} } };
+    gWeak[3212] = { 2.2e-9*cm, { {1.0, 3122,22} } };
+    gWeak[3322] = { 8.71*cm,   { {0.9952,3122,111} } };
+    gWeak[3312] = { 4.91*cm,   { {0.99887,3122,-211} } };
+    gWeak[3334] = { 2.461*cm,  { {0.678,3122,-321}, {0.236,3322,-211},
+                                 {0.086,3312,111} } };
+}
+
+void DecayWeakParticle(const Particle& par, std::vector<Particle>& out, int& nextID)
+{
+    int  apdg = std::abs(par.pid);
+    bool anti = (par.pid < 0);
+
+    if (apdg == 311) {
+        if (gRandom->Rndm() > 0.5) return;
+        apdg = 310; anti = false;
     }
+    auto it = gWeak.find(apdg);
+    if (it == gWeak.end()) return;
+    const WeakSpecies& sp = it->second;
 
-    return count;
+    double r = gRandom->Rndm(), cum = 0.0;
+    const WeakChannel* ch = nullptr;
+    for (const auto& c : sp.ch) { cum += c.br; if (r <= cum) { ch = &c; break; } }
+    if (!ch) return;
+
+    const int    d1 = Conj(ch->a, anti), d2 = Conj(ch->b, anti);
+    const double m1 = WeakMass(std::abs(d1)), m2 = WeakMass(std::abs(d2));
+    const double M  = WeakMass(apdg);
+    if (m1 < 0.0 || m2 < 0.0 || M < m1 + m2) return;
+
+    double u = gRandom->Rndm(); if (u <= 0.0) u = 1e-12;
+    const double tau   = -sp.ctau_fm * std::log(u);
+    const double gamma = par.E / M;
+    const double dt    = gamma * tau;
+    const double dvx = par.x + par.betaX()*dt, dvy = par.y + par.betaY()*dt;
+    const double dvz = par.z + par.betaZ()*dt, dvt = par.t + dt;
+
+    const double pcm = std::sqrt((M*M - (m1+m2)*(m1+m2)) *
+                                 (M*M - (m1-m2)*(m1-m2))) / (2.0*M);
+    const double ct = 2.0*gRandom->Rndm() - 1.0;
+    const double st = std::sqrt(1.0 - ct*ct);
+    const double ph = 2.0*TMath::Pi()*gRandom->Rndm();
+
+    TLorentzVector q1( pcm*st*std::cos(ph),  pcm*st*std::sin(ph),  pcm*ct,
+                       std::sqrt(m1*m1 + pcm*pcm));
+    TLorentzVector q2(-pcm*st*std::cos(ph), -pcm*st*std::sin(ph), -pcm*ct,
+                       std::sqrt(m2*m2 + pcm*pcm));
+
+    TVector3 beta(par.px/par.E, par.py/par.E, par.pz/par.E);
+    q1.Boost(beta); q2.Boost(beta);
+
+    auto emit = [&](int pdg, const TLorentzVector& p4) {
+        if (!(std::abs(pdg) == 211 || IsWeakParent(pdg))) return;
+        Particle d;
+        d.event_id = par.event_id;  d.ensemble_id = par.ensemble_id;
+        d.pid = pdg;
+        d.charge = (pdg == 211) ? 1 : (pdg == -211) ? -1 : 0;
+        d.ID = nextID++;
+        d.mom1 = par.pid;  d.mom2 = 0;
+        d.px = p4.Px(); d.py = p4.Py(); d.pz = p4.Pz(); d.E = p4.E();
+        d.proc_type      = par.proc_type;
+        d.proc_id_origin = par.proc_id_origin;
+        d.time_last_coll = par.time_last_coll;
+        d.form_time      = dvt;   // FIX 2b: fill form_time for injected daughters
+        d.x = dvx; d.y = dvy; d.z = dvz; d.t = dvt;
+        d.xf = dvx; d.yf = dvy; d.zf = dvz; d.tf = dvt;
+        d.hasExplicitEmissionPoint = true;
+        d.emissionOrigin = 3;
+        out.push_back(d);
+    };
+    emit(d1, q1);
+    emit(d2, q2);
+}
+
+void DecayWeakSpecies(std::vector<Particle>& particles, int& nextID)
+{
+    size_t begin = 0;
+    int nPions = 0;
+    for (int pass = 0; pass < 6; ++pass) {
+        const size_t end = particles.size();
+        std::vector<Particle> newD;
+        for (size_t i = begin; i < end; ++i)
+            if (IsWeakParent(particles[i].pid))
+                DecayWeakParticle(particles[i], newD, nextID);
+        if (newD.empty()) break;
+        for (const auto& d : newD) if (std::abs(d.pid) == 211) nPions++;
+        begin = end;
+        particles.insert(particles.end(), newD.begin(), newD.end());
+    }
+    std::cout << "Weak decays: created " << nPions << " charged pions\n";
 }
 
 // ============================================================
-// FitResult: everything the bootstrap needs to collect
+// Fit machinery
 // ============================================================
 struct FitResult {
     double alpha, alpha_err;
@@ -1072,15 +1037,12 @@ struct FitResult {
     int    ndf;
     int    status;
     bool   ok = false;
-    bool   boundaryReject = false;   // Fix 7: distinct boundary message
+    bool   boundaryReject = false;
     double devProj[3];
     double obsProj[3];
     double expProj[3];
 };
 
-// ============================================================
-// Per-projection diagnostics at the final parameters
-// ============================================================
 void ComputeProjectionDiagnostics(
     const HBTResults& res,
     double fit_min,
@@ -1092,39 +1054,33 @@ void ComputeProjectionDiagnostics(
     double expProj[3])
 {
     for (int i = 0; i < 3; ++i) { devProj[i] = obsProj[i] = expProj[i] = 0.0; }
-
     TH1F* hists[3] = {res.hOut, res.hSide, res.hLong};
 
     for (int i = 0; i < 3; ++i) {
-
         int lastLambdaBin = hists[i]->FindBin(rho_lambda_max);
         if (lastLambdaBin > hists[i]->GetNbinsX())
             lastLambdaBin = hists[i]->GetNbinsX();
 
-        const double normalizationCount = hists[i]->Integral(1, lastLambdaBin);
-        if (!(normalizationCount > 0.0)) continue;
+        /*const double normalizationCount = hists[i]->Integral(0, lastLambdaBin);
+        if (!(normalizationCount > 0.0)) continue;*/
+        
+        const double normalizationCount = static_cast<double>(res.total_pairs);   // same for all 3 projections
+if (!(normalizationCount > 0.0)) continue;  
 
         const int firstFitBin = hists[i]->FindBin(fit_min);
-
         for (int b = firstFitBin; b <= hists[i]->GetNbinsX(); ++b) {
             const double x = hists[i]->GetBinCenter(b);
             if (x < fit_min || x > fit_max_x[i]) continue;
-
             const double xlow  = hists[i]->GetBinLowEdge(b);
             const double xhigh = hists[i]->GetBinLowEdge(b + 1);
 
             double expected = normalizationCount *
                               IntegralLevyBin(p[0], p[i+1], p[4], xlow, xhigh);
-
             const double observed = hists[i]->GetBinContent(b);
 
-            double contrib;
-            if (observed > 0.0) {
-                contrib = 2.0 * (expected - observed
-                                 + observed * std::log(observed / expected));
-            } else {
-                contrib = 2.0 * expected;
-            }
+            double contrib = (observed > 0.0)
+                ? 2.0 * (expected - observed + observed * std::log(observed / expected))
+                : 2.0 * expected;
 
             devProj[i] += contrib;
             obsProj[i] += observed;
@@ -1133,22 +1089,19 @@ void ComputeProjectionDiagnostics(
     }
 }
 
-// ============================================================
-// Run one Levy fit on a given HBTResults.
-// ============================================================
 FitResult RunLevyFit(HBTResults& res,
                      double fit_min,
                      double fit_max,
                      double mT,
                      double rhoLamMax,
-                     const double* warmPar  = nullptr,
-                     int    nStarts         = 5)
+                     const double* warmPar = nullptr,
+                     int    nStarts        = 5)
 {
     FitResult fr{};
     const int NPAR = 5;
     double fit_max_x[3] = {fit_max, fit_max, fit_max};
-    
-        static const double starts[5][5] = {
+
+    static const double starts[5][5] = {
         {1.2,  6.0, 4.0,  5.0, 0.85},
         {1.5,  8.0, 7.0, 11.0, 0.82},
         {1.4,  5.0, 4.0,  6.0, 0.90},
@@ -1158,23 +1111,21 @@ FitResult RunLevyFit(HBTResults& res,
     const bool warm = (warmPar != nullptr);
 
     struct LogLikelihood {
-    HBTResults res;
-    double fit_min;
-    double fit_max_x[3];
-    double rho_lambda_max;
-    //double normScale;          // NEW: total observed counts, fixed
-    int* pBinsUsed;
+        HBTResults res;
+        double fit_min;
+        double fit_max_x[3];
+        double rho_lambda_max;
+        int*   pBinsUsed;
 
-    LogLikelihood(const HBTResults& r, double min,
-                  const double mv[3], double rhoLamMax, int* bp)
-        : res(r), fit_min(min), rho_lambda_max(rhoLamMax), pBinsUsed(bp)
-    {
-        for (int i = 0; i < 3; ++i) fit_max_x[i] = mv[i];
-
-    }
+        LogLikelihood(const HBTResults& r, double min,
+                      const double mv[3], double rhoLamMax, int* bp)
+            : res(r), fit_min(min), rho_lambda_max(rhoLamMax), pBinsUsed(bp)
+        {
+            for (int i = 0; i < 3; ++i) fit_max_x[i] = mv[i];
+        }
 
         double operator()(const double* p) const {
-        double deviance = 0.0;
+            double deviance = 0.0;
             int currentBins = 0;
             TH1F* hists[3] = {res.hOut, res.hSide, res.hLong};
 
@@ -1183,32 +1134,25 @@ FitResult RunLevyFit(HBTResults& res,
                 if (lastLambdaBin > hists[i]->GetNbinsX())
                     lastLambdaBin = hists[i]->GetNbinsX();
 
-                const double normalizationCount =
-                    hists[i]->Integral(1, lastLambdaBin);
-                if (!(normalizationCount > 0.0)) return 1.0e100;
+      const double normalizationCount = static_cast<double>(res.total_pairs); //same for 3 projections
+          if (!(normalizationCount > 0.0)) return 1.0e100;
 
                 const int firstFitBin = hists[i]->FindBin(fit_min);
-
                 for (int b = firstFitBin; b <= hists[i]->GetNbinsX(); ++b) {
                     const double x = hists[i]->GetBinCenter(b);
                     if (x < fit_min || x > fit_max_x[i]) continue;
-
                     const double xlow  = hists[i]->GetBinLowEdge(b);
                     const double xhigh = hists[i]->GetBinLowEdge(b + 1);
 
                     double expected = normalizationCount *
                         IntegralLevyBin(p[0], p[i+1], p[4], xlow, xhigh);
-
-                    if (!std::isfinite(expected) || expected < 0.0)
-                        return 1.0e100;
+                    if (!std::isfinite(expected) || expected < 0.0) return 1.0e100;
                     if (expected < 1e-12) expected = 1e-12;
 
                     const double observed = hists[i]->GetBinContent(b);
-
                     if (observed > 0.0) {
                         deviance += 2.0 * (expected - observed
-                                           + observed *
-                                             std::log(observed / expected));
+                                           + observed * std::log(observed / expected));
                     } else {
                         deviance += 2.0 * expected;
                     }
@@ -1217,9 +1161,8 @@ FitResult RunLevyFit(HBTResults& res,
             }
             if (pBinsUsed) *pBinsUsed = currentBins;
             return deviance;
-    }
-};
-
+        }
+    };
 
     int actualBins =
         CountFitBins(res.hOut,  fit_min, fit_max) +
@@ -1228,14 +1171,13 @@ FitResult RunLevyFit(HBTResults& res,
 
     LogLikelihood loglikfunc(res, fit_min, fit_max_x, rhoLamMax, &actualBins);
     ROOT::Math::Functor f(loglikfunc, NPAR);
-    
-        bool   have    = false;
+
+    bool   have    = false;
     double bestDev = 1.0e300;
     int    bestSt  = 99;
     double bestX[NPAR] = {0}, bestE[NPAR] = {0};
 
     for (int s = 0; s < nStarts; ++s) {
-
         double st0[NPAR];
         for (int i = 0; i < NPAR; ++i)
             st0[i] = (warm && s == 0) ? warmPar[i] : starts[s][i];
@@ -1261,13 +1203,11 @@ FitResult RunLevyFit(HBTResults& res,
 
         const int    st  = m->Status();
         const double edm = m->Edm();
-
         const bool accepted =
             (st == 0) || (st == 1) || (st == 3 && edm < 0.01);
 
         if (accepted) {
             m->Hesse();
-
             const double* x = m->X();
             const double* e = m->Errors();
 
@@ -1296,7 +1236,6 @@ FitResult RunLevyFit(HBTResults& res,
                 have = true;
             }
         }
-
         delete m;
     }
 
@@ -1312,10 +1251,12 @@ FitResult RunLevyFit(HBTResults& res,
 
     const bool finiteFinal =
         std::isfinite(fr.deviance) &&
-        std::isfinite(fr.alpha)  && std::isfinite(fr.Rout)  && std::isfinite(fr.Rside) &&
-        std::isfinite(fr.Rlong)  && std::isfinite(fr.lambda) &&
-        std::isfinite(fr.alpha_err) && std::isfinite(fr.Rout_err)  && std::isfinite(fr.Rside_err) &&
-        std::isfinite(fr.Rlong_err) && std::isfinite(fr.lambda_err);
+        std::isfinite(fr.alpha) && std::isfinite(fr.Rout) &&
+        std::isfinite(fr.Rside) && std::isfinite(fr.Rlong) &&
+        std::isfinite(fr.lambda) &&
+        std::isfinite(fr.alpha_err) && std::isfinite(fr.Rout_err) &&
+        std::isfinite(fr.Rside_err) && std::isfinite(fr.Rlong_err) &&
+        std::isfinite(fr.lambda_err);
 
     const bool atBoundaryFinal =
         fr.Rout  > 19.9 || fr.Rside > 19.9 || fr.Rlong > 19.9 ||
@@ -1324,31 +1265,132 @@ FitResult RunLevyFit(HBTResults& res,
         fr.lambda <  0.001 || fr.lambda >  1.199;
 
     fr.boundaryReject = finiteFinal && atBoundaryFinal;
-
-
-   /* const double edm = minimizer->Edm();
-    const bool edmOK = std::isfinite(bestEdm) && bestEdm < 1e-6;
-    fr.ok = finiteAll && !atBoundary && fr.ndf > 0 && bestCov >= 2
-            && (bestStatus == 0 || (bestStatus == 3 && edmOK));*/
-
-    // EPOS acceptance rule: no covStatus requirement.
     fr.ok = have && finiteFinal && !atBoundaryFinal && fr.ndf > 0;
 
-    // Recompute per-projection diagnostics at the winning parameters.
     ComputeProjectionDiagnostics(res, fit_min, fit_max_x, rhoLamMax,
                                  bestX, fr.devProj, fr.obsProj, fr.expProj);
-
     return fr;
 }
 
+// ============================================================
+// Bootstrap (with pair cache)
+// ============================================================
+struct PairTriplet { double r_out, r_side, r_long; float mT; };
 
-// ============================================================
-// Rebuild HBTResults from a resampled event list.
-// ============================================================
-HBTResults AnalyzePairsForEventList(
-    const std::map<int, std::vector<Particle>>& events,
-    const std::vector<int>& chosenEvents,
-    double kT_min, double kT_max)
+// ------------------------------------------------------------
+// Build the per-event, per-kT-bin pair cache.
+// ------------------------------------------------------------
+std::vector<std::map<int, std::vector<PairTriplet>>>
+BuildPairCache(const std::vector<Particle>& particles,
+               const std::vector<double>& kT_bins)
+{
+    const int nBins = (int)kT_bins.size() - 1;
+    std::vector<std::map<int, std::vector<PairTriplet>>> cache(nBins);
+
+    std::map<int, std::vector<const Particle*>> events;
+    for (const auto& p : particles) {
+        if (std::abs(p.pid) != 211) continue;
+        events[p.event_id].push_back(&p);
+    }
+
+    for (int ibin = 0; ibin < nBins; ++ibin) {
+        const double kT_lo = kT_bins[ibin];
+        const double kT_hi = kT_bins[ibin+1];
+
+        for (auto& evpair : events) {
+            int evid = evpair.first;
+            const auto& v = evpair.second;
+            auto& slot = cache[ibin][evid];
+
+            for (size_t i = 0; i < v.size(); ++i) {
+                const Particle& p1 = *v[i];
+                if (p1.pT() < pT_min || p1.pT() > pT_max) continue;
+                if (fabs(p1.eta()) > eta_cut) continue;
+
+                for (size_t j = i + 1; j < v.size(); ++j) {
+                    const Particle& p2 = *v[j];
+                    if (p2.pT() < pT_min || p2.pT() > pT_max) continue;
+                    if (fabs(p2.eta()) > eta_cut) continue;
+                    if (p1.pid != p2.pid) continue;
+
+                    double kx = 0.5*(p1.px + p2.px);
+                    double ky = 0.5*(p1.py + p2.py);
+                    double kz = 0.5*(p1.pz + p2.pz);
+                    double kT = std::sqrt(kx*kx + ky*ky);
+                    if (kT < kT_lo || kT >= kT_hi) continue;
+                    if (!(kT > 0.0) || !std::isfinite(kT)) continue;
+
+                    const double mpi = 0.13957;
+                    double mT    = std::sqrt(kT*kT + mpi*mpi);
+                    double qmCut = std::sqrt(0.2 * mT);
+
+                    double qx    = p1.px - p2.px;
+                    double qy    = p1.py - p2.py;
+                    double qzL   = (4*std::pow(p1.pz*p2.E - p2.pz*p1.E,2)) /
+                                   (std::pow(p1.E+p2.E,2) - std::pow(p1.pz+p2.pz,2));
+                    double qLCMS = std::sqrt(qx*qx + qy*qy + qzL);
+                    if (qLCMS > qmCut) continue;
+
+                    double dx = p1.xf - p2.xf;
+                    double dy = p1.yf - p2.yf;
+                    double dz = p1.zf - p2.zf;
+                    double dt = p1.tf - p2.tf;
+                    double K0  = 0.5*(p1.E + p2.E);
+                    double kp  = K0*K0 - kz*kz;
+                    double phi = std::atan2(ky, kx);
+                    if (!(kp > 0.0) || !std::isfinite(kp)) continue;
+
+                    double r_out  = std::cos(phi)*dx + std::sin(phi)*dy
+                                  - (kT/kp)*(K0*dt - kz*dz);
+                    double r_side = -std::sin(phi)*dx + std::cos(phi)*dy;
+                    double r_long = (K0*dz - kz*dt) / std::sqrt(kp);
+                    if (!std::isfinite(r_out) || !std::isfinite(r_side) ||
+                        !std::isfinite(r_long)) continue;
+
+                    slot.push_back({r_out, r_side, r_long, (float)mT});
+                }
+            }
+        }
+    }
+    return cache;
+}
+
+struct MTStats { long n = 0; double meanMT = 0, rmsMT = 0, meanKT = 0; TH1D* h = nullptr; };
+
+std::vector<MTStats> ComputeMTStats(
+    const std::vector<std::map<int, std::vector<PairTriplet>>>& cache,
+    const std::vector<double>& kT_bins)
+{
+    const double mpi = 0.13957;
+    std::vector<MTStats> out(cache.size());
+    for (size_t ib = 0; ib < cache.size(); ++ib) {
+        MTStats& s = out[ib];
+        s.h = new TH1D(Form("hMT_%d", (int)ib),
+                       Form("m_{T} of pairs, k_{T} %.3f-%.3f;m_{T} [GeV];pairs",
+                            kT_bins[ib], kT_bins[ib+1]), 200, 0.13, 1.2);
+        double sum = 0, sum2 = 0, sumK = 0;
+        for (auto& ev : cache[ib])
+            for (auto& t : ev.second) {
+                const double m = t.mT;
+                sum += m; sum2 += m*m;
+                sumK += std::sqrt(std::max(0.0, m*m - mpi*mpi));
+                s.h->Fill(m); ++s.n;
+            }
+        if (s.n > 0) {
+            s.meanMT = sum / s.n;
+            s.rmsMT  = std::sqrt(std::max(0.0, sum2 / s.n - s.meanMT * s.meanMT));
+            s.meanKT = sumK / s.n;
+        }
+    }
+    return out;
+}
+
+// ------------------------------------------------------------
+// Fill histograms from the cache for a chosen set of events.
+// ------------------------------------------------------------
+/*HBTResults FillFromCache(
+    const std::map<int, std::vector<PairTriplet>>& cacheForBin,
+    const std::vector<int>& chosenEvents)
 {
     const int n_bins = 300;
     const double rho_min = 0.1;
@@ -1365,68 +1407,18 @@ HBTResults AnalyzePairsForEventList(
     hRho->Sumw2(); hOut->Sumw2(); hSide->Sumw2(); hLong->Sumw2();
 
     int pairs_count = 0;
-    const double mpi = 0.13957;
-
     for (int evid : chosenEvents) {
-        auto it = events.find(evid);
-        if (it == events.end()) continue;
-        const auto& v = it->second;
-
-        for (size_t i = 0; i < v.size(); ++i) {
-            const Particle& p1 = v[i];
-            if (p1.pT() < pT_min || p1.pT() > pT_max) continue;
-            if (fabs(p1.eta()) > eta_cut) continue;
-
-            for (size_t j = i + 1; j < v.size(); ++j) {
-                const Particle& p2 = v[j];
-                if (p2.pT() < pT_min || p2.pT() > pT_max) continue;
-                if (fabs(p2.eta()) > eta_cut) continue;
-                if (p1.pid != p2.pid) continue;
-
-                double kx = 0.5*(p1.px + p2.px);
-                double ky = 0.5*(p1.py + p2.py);
-                double kz = 0.5*(p1.pz + p2.pz);
-                double kT = TMath::Sqrt(kx*kx + ky*ky);
-                
-                if (kT < kT_min || kT >= kT_max) continue;
-                if (!(kT > 0.0)  || !std::isfinite(kT)) continue;
-
-                double mT = sqrt(kT*kT + mpi*mpi);
-                double qmCut = sqrt(0.2 * mT);
-                double qx = p1.px - p2.px;
-                double qy = p1.py - p2.py;
-                double qzL = (4*pow(p1.pz*p2.E - p2.pz*p1.E,2)) /
-                             (pow(p1.E + p2.E,2) - pow(p1.pz + p2.pz,2));
-                double qLCMS = TMath::Sqrt(qx*qx + qy*qy + qzL);
-                if (qLCMS > qmCut) continue;
-
-                pairs_count++;
-
-                double dx = p1.xf - p2.xf;
-                double dy = p1.yf - p2.yf;
-                double dz = p1.zf - p2.zf;
-                double dt = p1.tf - p2.tf;
-                double K0 = 0.5*(p1.E + p2.E);
-                double kp = K0*K0 - kz*kz;
-                double phi = atan2(ky, kx);
-                
-                if (!(kp > 0.0) || !std::isfinite(kp)) continue;
-
-                double r_out  = TMath::Cos(phi)*dx + TMath::Sin(phi)*dy
-                              - (kT/kp)*(K0*dt - kz*dz);
-                double r_side = -TMath::Sin(phi)*dx + TMath::Cos(phi)*dy;
-                double r_long = (K0*dz - kz*dt) / sqrt(kp);
-                double rho = sqrt(r_out*r_out + r_side*r_side + r_long*r_long);
-                
-                if (!std::isfinite(r_out)  || !std::isfinite(r_side) ||
-                    !std::isfinite(r_long) || !std::isfinite(rho))  continue;
-
-
-                hRho->Fill(rho);
-                hOut->Fill(fabs(r_out));
-                hSide->Fill(fabs(r_side));
-                hLong->Fill(fabs(r_long));
-            }
+        auto it = cacheForBin.find(evid);
+        if (it == cacheForBin.end()) continue;
+        for (const auto& t : it->second) {
+            double rho = std::sqrt(t.r_out*t.r_out
+                                 + t.r_side*t.r_side
+                                 + t.r_long*t.r_long);
+            hRho->Fill(rho);
+            hOut->Fill(std::fabs(t.r_out));
+            hSide->Fill(std::fabs(t.r_side));
+            hLong->Fill(std::fabs(t.r_long));
+            ++pairs_count;
         }
     }
 
@@ -1434,12 +1426,53 @@ HBTResults AnalyzePairsForEventList(
     res.hOut = hOut; res.hSide = hSide; res.hLong = hLong;
     res.hRho = hRho; res.total_pairs = pairs_count;
     return res;
+}*/
+
+HBTResults FillFromCache(const std::map<int, std::vector<PairTriplet>>& cacheForBin,
+                         const std::vector<int>& chosenEvents,
+                         double rhoCut)
+{
+    const int n_bins = 300;
+    const double rho_min = 0.1, rho_max = 1.0e15;
+    double bins[n_bins + 1];
+    const double logStep = std::pow(rho_max / rho_min, 1.0 / n_bins);
+    bins[0] = rho_min;
+    for (int i = 1; i <= n_bins; ++i) bins[i] = bins[i-1] * logStep;
+
+    TH1F* hRho  = new TH1F("hRho_b",  "", n_bins, bins);
+    TH1F* hOut  = new TH1F("hOut_b",  "", n_bins, bins);
+    TH1F* hSide = new TH1F("hSide_b", "", n_bins, bins);
+    TH1F* hLong = new TH1F("hLong_b", "", n_bins, bins);
+    hRho->Sumw2(); hOut->Sumw2(); hSide->Sumw2(); hLong->Sumw2();
+
+    int pairs_count = 0;
+    for (int evid : chosenEvents) {
+        auto it = cacheForBin.find(evid);
+        if (it == cacheForBin.end()) continue;
+        for (const auto& t : it->second) {
+            const double rho = std::sqrt(t.r_out*t.r_out + t.r_side*t.r_side + t.r_long*t.r_long);
+            if (!(rho < rhoCut)) continue;                       // joint cut
+            hRho->Fill(rho);
+            hOut->Fill(std::fabs(t.r_out));
+            hSide->Fill(std::fabs(t.r_side));
+            hLong->Fill(std::fabs(t.r_long));
+            ++pairs_count;
+        }
+    }
+    HBTResults res;
+    res.hOut = hOut; res.hSide = hSide; res.hLong = hLong;
+    res.hRho = hRho; res.total_pairs = pairs_count;
+    return res;
 }
 
-// ============================================================
-// Event-level bootstrap for one kT bin.
-// Fix 6: seed the RNG per bin so replicas are independent.
-// ============================================================
+static void FreeHBT(HBTResults& r)
+{
+    delete r.hOut; delete r.hSide; delete r.hLong; delete r.hRho;
+    r.hOut = r.hSide = r.hLong = r.hRho = nullptr;
+}
+
+
+
 struct BootstrapResult {
     std::vector<double> alpha, Rout, Rside, Rlong, lambda;
     std::vector<double> deviance;
@@ -1447,29 +1480,26 @@ struct BootstrapResult {
 };
 
 BootstrapResult RunEventBootstrap(
-    const std::map<int, std::vector<Particle>>& eventsByID,
+    const std::vector<std::map<int, std::vector<PairTriplet>>>& pairCache,
     const std::vector<int>& all_event_ids,
-    double kT_min, double kT_max,
+    int kT_bin_index,
     double fit_min, double fit_max, double mT,
     double rhoLamMax,
     double D_nominal,
-    const double* nominalPar,        // NEW
+    const double* nominalPar,
     int binIndex,
-    int B = 200)
-
+    int B = 100)
 {
     BootstrapResult br;
-    
-        double warmPar[5] = {0,0,0,0,0};
+    double warmPar[5] = {0,0,0,0,0};
     if (nominalPar)
         for (int ip = 0; ip < 5; ++ip) warmPar[ip] = nominalPar[ip];
 
-
-    // Fix 6: seed depends on the bin index
     TRandom3 boot_rng(12345 + binIndex);
-
     const int N = (int)all_event_ids.size();
     if (N == 0) return br;
+
+    const auto& cacheForBin = pairCache[kT_bin_index];
 
     for (int b = 0; b < B; ++b) {
         std::vector<int> chosen;
@@ -1477,20 +1507,17 @@ BootstrapResult RunEventBootstrap(
         for (int k = 0; k < N; ++k)
             chosen.push_back(all_event_ids[boot_rng.Integer(N)]);
 
-        HBTResults res_b = AnalyzePairsForEventList(
-            eventsByID, chosen, kT_min, kT_max);
-
-        if (res_b.total_pairs < 10) {
+     HBTResults res_b = FillFromCache(cacheForBin, chosen, rhoLamMax);
+        if (res_b.total_pairs < 100) {
             delete res_b.hOut;  delete res_b.hSide;
             delete res_b.hLong; delete res_b.hRho;
             continue;
         }
 
-        FitResult fr = RunLevyFit(res_b, fit_min, fit_max, mT, rhoLamMax, warmPar,/*nStarts=*/2);
-
+        FitResult fr = RunLevyFit(res_b, fit_min, fit_max, mT, rhoLamMax,
+                                  warmPar, /*nStarts=*/2);
         delete res_b.hOut;  delete res_b.hSide;
         delete res_b.hLong; delete res_b.hRho;
-
         if (!fr.ok) continue;
 
         br.alpha.push_back(fr.alpha);
@@ -1509,9 +1536,6 @@ BootstrapResult RunEventBootstrap(
     return br;
 }
 
-// ============================================================
-// RMS returns NaN when there are <2 samples
-// ============================================================
 double BootstrapRMS(const std::vector<double>& v) {
     if (v.size() < 2) return std::numeric_limits<double>::quiet_NaN();
     double m = 0.0;
@@ -1522,9 +1546,6 @@ double BootstrapRMS(const std::vector<double>& v) {
     return std::sqrt(s2 / (v.size() - 1));
 }
 
-// ============================================================
-// Percentile helper
-// ============================================================
 double Quantile(std::vector<double> v, double prob) {
     if (v.empty()) return std::numeric_limits<double>::quiet_NaN();
     std::sort(v.begin(), v.end());
@@ -1533,9 +1554,6 @@ double Quantile(std::vector<double> v, double prob) {
     return v[lo] + (pos - lo) * (v[hi] - v[lo]);
 }
 
-// ============================================================
-// Fix 5: set the y-range of a graph from its data with a margin
-// ============================================================
 void SetDataDrivenYRange(TGraphErrors* g,
                          const std::vector<double>& vals,
                          double marginFrac = 0.10)
@@ -1548,9 +1566,136 @@ void SetDataDrivenYRange(TGraphErrors* g,
     g->GetHistogram()->GetYaxis()->SetRangeUser(ylo - m, yhi + m);
 }
 
-// ---------------------------
-// Main Function
-// ---------------------------
+int CountFitBins(TH1* h, double fitMin, double fitMax)
+{
+    int count = 0;
+    for (int b = 1; b <= h->GetNbinsX(); ++b) {
+        const double x = h->GetBinCenter(b);
+        if (x >= fitMin && x <= fitMax) ++count;
+    }
+    return count;
+}
+
+static void PrintNCollDiagnostic(const std::vector<Particle>& particles)
+{
+    int nNC = 0, nNCbad = 0;
+    for (const auto& p : particles) {
+        if (std::abs(p.pid) != 211) continue;
+        if (p.ncoll == 0) {
+            nNC++;
+            if (p.form_time <= 0.0) nNCbad++;
+        }
+    }
+    std::cout << "Pions with ncoll = 0: " << nNC
+              << "  (of which form_time <= 0: " << nNCbad << ")\n";
+}
+//Diagnoistics vertex time distribution
+
+void DrawEmissionTimeCheck(const std::vector<Particle>& particles,
+                           double tEnd = 300.0)
+{
+    const char* names[4] = {"core / halo-sampled", "history",
+                            "eta fallback", "weak forced"};
+    const int    cols[4] = {kGray, kBlue, kRed, kGreen+2};
+
+    // Log-spaced bins from 0.1 fm to 1e15 fm, 60 bins per decade.
+    const int    nBinsPerDec = 60;
+    const double tLo = 0.1;
+    const double tHi = 1.0e15;
+    const int    nDec = (int)std::round(std::log10(tHi / tLo));
+    const int    nBins = nDec * nBinsPerDec;
+
+    double edges[nBins + 1];
+    const double logStep = std::log10(tHi / tLo) / nBins;
+    edges[0] = tLo;
+    for (int i = 1; i <= nBins; ++i)
+        edges[i] = tLo * std::pow(10.0, i * logStep);
+
+    TH1D* h[4];
+    for (int i = 0; i < 4; ++i) {
+        h[i] = new TH1D(Form("hT%d", i),
+                        Form("%s;t_{f} [fm/c];pions per log bin", names[i]),
+                        nBins, edges);
+        h[i]->SetDirectory(0);
+    }
+
+    long nAtEnd[4] = {0,0,0,0}, nTot[4] = {0,0,0,0};
+    long nOverflow[4] = {0,0,0,0}, nNeg[4] = {0,0,0,0};
+    double minT[4] = {1e300,1e300,1e300,1e300};
+    double maxT[4] = {-1e300,-1e300,-1e300,-1e300};
+
+    for (const auto& p : particles) {
+        if (std::abs(p.pid) != 211) continue;
+        const int o = p.emissionOrigin;
+        if (o < 0 || o > 3) continue;
+
+        if (p.tf < 0.0) { ++nNeg[o]; continue; }        // shouldn't happen
+        if (p.tf > tHi) { ++nOverflow[o]; }
+        h[o]->Fill(p.tf);
+        ++nTot[o];
+        if (p.tf < minT[o]) minT[o] = p.tf;
+        if (p.tf > maxT[o]) maxT[o] = p.tf;
+
+        if (std::fabs(p.tf - tEnd) < 1.0e-3) ++nAtEnd[o];
+    }
+
+    // ---- Console diagnostic ----
+    std::cout << "\n=== Forced-decay emission-time diagnostic ===\n";
+    std::cout << "t_end = " << tEnd << " fm/c\n";
+    for (int i = 0; i < 4; ++i) {
+        if (nTot[i] == 0) {
+            std::cout << "  origin " << i << " (" << names[i] << "): no pions\n";
+            continue;
+        }
+        std::cout << "  origin " << i << " (" << names[i] << "):"
+                  << " N=" << nTot[i]
+                  << "  t_f range = [" << minT[i] << ", " << maxT[i] << "] fm/c"
+                  << "  n(t_f ~ t_end) = " << nAtEnd[i]
+                  << " (" << (100.0 * nAtEnd[i] / nTot[i]) << "%)"
+                  << "  overflow (t_f > " << tHi << ") = " << nOverflow[i];
+        if (nNeg[i] > 0) std::cout << "  NEGATIVE t_f = " << nNeg[i];
+        std::cout << "\n";
+    }
+
+    // ---- Canvas ----
+    TCanvas* c = new TCanvas("cEmisT", "emission times by origin", 1100, 700);
+    c->cd(1);
+    gPad->SetLogx();
+    gPad->SetLogy();
+
+    TLegend* leg = new TLegend(0.55, 0.65, 0.92, 0.90);
+    leg->SetBorderSize(0); leg->SetFillStyle(0);
+
+    bool first = true;
+    for (int i = 0; i < 4; ++i) {
+        if (nTot[i] == 0) continue;
+        h[i]->SetLineColor(cols[i]);
+        h[i]->SetLineWidth(2);
+        h[i]->GetXaxis()->SetTitle("t_{f} [fm/c]");
+        h[i]->GetYaxis()->SetTitle("Pions Multiplicity");
+        h[i]->Draw(first ? "HIST" : "HIST SAME");
+        first = false;
+        leg->AddEntry(h[i],
+                      Form("%s  N=%ld ",
+                           names[i], nTot[i]),
+                      "L");
+    }
+    leg->Draw();
+
+    // Reference decade markers to see the scales
+    for (double x = 1.0; x <= tHi; x *= 10.0) {
+        TLine* l = new TLine(x, 0.5, x, 1e10);
+        l->SetLineStyle(3);
+        l->SetLineColor(kGray+2);
+        l->Draw();
+    }
+
+    c->SaveAs("emission_time_by_origin.png");
+}
+
+// ============================================================
+// Main
+// ============================================================
 void auau3D()
 {
     gStyle->SetOptStat(0);
@@ -1566,21 +1711,24 @@ void auau3D()
     LoadParticleTable("/home/zeinab/Documents/vhlle-smash/smash/input/particles.txt");
     LoadDecayModes("/home/zeinab/Documents/vhlle-smash/smash/input/decaymodes.txt");
 
-    cout << "\n=== DEBUG ETA DECAYS ===" << endl;
-
-    cout << "nameToPDG[eta] = " << nameToPDG["eta"] << endl;
-    cout << "decayTable has eta? " << decayTable.count(221) << endl;
-
+    cout << "\n=== DEBUG ETA DECAYS ===\n";
+    cout << "nameToPDG[eta] = " << nameToPDG["eta"] << "\n";
+    cout << "decayTable has eta? " << decayTable.count(221) << "\n";
     if (decayTable.count(221)) {
-        cout << "N eta channels = " << decayTable[221].size() << endl;
+        cout << "N eta channels = " << decayTable[221].size() << "\n";
         for (const auto& ch : decayTable[221]) {
             cout << "BR = " << ch.br << " daughters: ";
             for (auto& d : ch.daughters) cout << d << " ";
-            cout << endl;
+            cout << "\n";
         }
     }
 
     vector<Particle> particles = LoadOSCAR(oscar_file);
+
+    // FIX 4: ncoll diagnostic moved before any forced decays.
+    PrintNCollDiagnostic(particles);
+
+    int nextID = particles.size() + 100000;
 
     std::map<ParticleKey, ProductionInfo> productionMap;
     for (const auto& histFile : fullHistoryFiles) {
@@ -1588,11 +1736,7 @@ void auau3D()
     }
     MatchHistoryVertices(particles, productionMap);
 
-    std::map<int, const Particle*> particleByID;
-    for (const auto& p : particles) {
-        particleByID[p.ID] = &p;
-    }
-
+    // ---- Eta fallback ----
     std::set<std::pair<int,int>> etaMatched;
     for (const auto& p : particles) {
         if (std::abs(p.pid) == 211 && p.hasHistoryProductionVertex &&
@@ -1602,9 +1746,7 @@ void auau3D()
     }
 
     std::vector<Particle> eta_daughters;
-    int nextID = particles.size() + 100000;
     int etasSkipped = 0, etasDecayed = 0;
-
     for (const auto& p : particles) {
         if (std::abs(p.pid) == 221) {
             if (etaMatched.count({p.event_id, p.ID})) {
@@ -1620,32 +1762,48 @@ void auau3D()
               << etasDecayed << " decayed via fallback sampling\n";
     std::cout << "Created " << eta_daughters.size() << " eta daughter particles\n";
 
-    size_t oldSize = particles.size();
     particles.insert(particles.end(), eta_daughters.begin(), eta_daughters.end());
 
-    particles.reserve(particles.size());
-    for (size_t i = oldSize; i < particles.size(); ++i) {
-        particleByID[particles[i].ID] = &particles[i];
-    }
-
     int etaPions = 0;
-    for (const auto& d : eta_daughters) {
+    for (const auto& d : eta_daughters)
         if (std::abs(d.pid) == 211) etaPions++;
-    }
     std::cout << "Generated " << etaPions << " charged pions from eta decays\n";
 
+    // ---- Weak decays ----
+    InitWeakTable();
+    DecayWeakSpecies(particles, nextID);
+
+    // ---- Unstable-particle census ----
+    std::map<int,int> unstableLeft;
+    for (const auto& p : particles) {
+        auto it = particleTable.find(std::abs(p.pid));
+        if (it == particleTable.end()) continue;
+        const double width = it->second.width;
+        if (!(width > 0.0)) continue;
+        const double ctau = hbarc / width;
+        if (ctau > 1.0e15) continue;
+        unstableLeft[p.pid]++;
+    }
+    std::cout << "Unstable particles still present in the final set:\n";
+    for (auto& kv : unstableLeft)
+        std::cout << "  PDG " << kv.first << " : " << kv.second << "\n";
+
+    // ---- Emission points ----
     for (auto& p : particles) {
-        int parentPDG = findOriginalParent(p, particleByID);
-        bool isHalo = (parentPDG != 0) && isHaloParent(parentPDG);
+        int  parentPDG = findOriginalParent(p);
+        bool isHalo    = (parentPDG != 0) && isHaloParent(parentPDG);
         assignEmissionPoint(p, parentPDG, isHalo);
     }
+    
+    DrawEmissionTimeCheck(particles, 300.0);
 
     std::cout << "\n=== Simulated parent emission radii ===\n";
     ComputeParentMedianEmission(particles);
 
-    SourceStats stats = CountPionSources(particles, particleByID);
+    SourceStats stats = CountPionSources(particles);
     PrintSourceStats(stats);
 
+    // ---- Event list ----
     vector<int> all_event_ids;
     set<int> seen;
     for (const auto& p : particles) {
@@ -1654,30 +1812,48 @@ void auau3D()
         }
     }
     int total_events = all_event_ids.size();
-
     cout << "Found " << total_events << " unique events in sample." << endl;
 
-    std::map<int, std::vector<Particle>> eventsByID;
-    for (const auto& p : particles) {
-        if (std::abs(p.pid) != 211) continue;
-        eventsByID[p.event_id].push_back(p);
-    }
+    std::set<std::pair<int,int>> evEns;
+    for (const auto& p : particles)
+        evEns.insert({p.event_id, p.ensemble_id});
+    if (evEns.size() != (size_t)total_events)
+        std::cout << "WARNING: " << total_events << " event ids but "
+                  << evEns.size() << " distinct (event,ensemble) pairs"
+                  << " -- event ids reused across runs!\n";
 
+    //============================ DATA FITTING ================
     myLevy_reader = new Levy_reader("levy_proj3D_values.dat");
 
     vector<double> kT_bins;
-    // Fix 6 (user side): restored the final kT range
-    double kT_min_val = 0.35;
-    double kT_max_val = 0.45;
+    double kT_min_val = 0.175;
+    double kT_max_val = 0.725;
     double step = 0.05;
-    for(double k = kT_min_val; k <= kT_max_val + 1e-6; k += step) {
+    for (double k = kT_min_val; k <= kT_max_val + 1e-6; k += step) {
         kT_bins.push_back(k);
     }
-    int nBins = kT_bins.size()-1;
+    int nBins = kT_bins.size() - 1;
 
-    // ============================================================
-    // rho_max^lambda cutoffs
-    // ============================================================
+    // FIX 6: build the pair cache once, before the kT loop.
+    std::cout << "\nBuilding pair cache...\n";
+    auto pairCache = BuildPairCache(particles, kT_bins);
+    std::cout << "Pair cache ready.\n";
+
+auto mtStats = ComputeMTStats(pairCache, kT_bins);
+{
+    TFile fmt("mT_distributions.root", "RECREATE");
+    for (int ib = 0; ib < nBins; ++ib) {
+        const double kc = 0.5 * (kT_bins[ib] + kT_bins[ib+1]);
+        const double mc = std::sqrt(kc*kc + 0.13957*0.13957);
+        std::cout << "kT " << kT_bins[ib] << "-" << kT_bins[ib+1]
+                  << "  N=" << mtStats[ib].n << "  <mT>=" << mtStats[ib].meanMT
+                  << "  RMS=" << mtStats[ib].rmsMT << "  mT(centre)=" << mc
+                  << "  diff=" << mtStats[ib].meanMT - mc << "\n";
+        mtStats[ib].h->Write();
+    }
+    fmt.Close();
+}
+
     vector<pair<string, double>> rhoLambdaCutoffs = {
         {"1mm",   1.0e12},
         {"5mm",   5.0e12},
@@ -1685,23 +1861,20 @@ void auau3D()
         {"50cm",  5.0e14}
     };
 
-    // Storage: fit parameters
     vector<double> mt_vals, mt_err;
     vector<double> alpha_vals, alpha_err;
-    vector<double> Rout_vals, Rout_err;
+    vector<double> Rout_vals,  Rout_err;
     vector<double> Rside_vals, Rside_err;
     vector<double> Rlong_vals, Rlong_err;
     vector<double> chi2_vals, ndf_vals, CL_vals;
     vector<int> success_vals;
 
-    // Fix 2: bootstrap count raised to 500
-    const int nBootstrap = 17;
+    const int nBootstrap = 50;   // FIX 5: production value
 
     vector<double> kTlo_vals, kThi_vals;
     vector<double> alpha_bootErr, Rout_bootErr, Rside_bootErr, Rlong_bootErr, lambda_bootErr;
     vector<double> lambda_bootLo, lambda_bootHi, alpha_bootLo, alpha_bootHi;
 
-    // Storage: lambda per cutoff
     map<string, vector<double>> lambda_by_cutoff;
     map<string, vector<double>> lambda_err_by_cutoff;
     for (auto& lc : rhoLambdaCutoffs) {
@@ -1709,58 +1882,56 @@ void auau3D()
         lambda_err_by_cutoff[lc.first] = {};
     }
 
-    // --- Loop over kT bins ---
-    for(int ibin = 0; ibin < nBins; ibin++) {
-        double kT_min = kT_bins[ibin];
-        double kT_max = kT_bins[ibin+1];
-        cout << "\n=== kT bin: " << kT_min << " - " << kT_max << " ===" << endl;
+    // ---- kT loop ----
+        for (int ibin = 0; ibin < nBins; ibin++) {
+    const double kT_min = kT_bins[ibin], kT_max = kT_bins[ibin+1];
+    cout << "\n=== kT bin: " << kT_min << " - " << kT_max << " ===" << endl;
+    if (mtStats[ibin].n < 100) continue;
 
-        HBTResults res = AnalyzePairs(particles, particleByID, kT_min, kT_max, false);
-        if (res.total_pairs < 10) continue;
+    const double fit_min = 0.1;
+    const double mT      = mtStats[ibin].meanMT;
+    const double fit_max = std::sqrt(2500.0 / mT);
+    const double NaN     = std::numeric_limits<double>::quiet_NaN();
 
-        const double fit_min = 0.1;
-        double kT_mean = 0.5*(kT_min+kT_max);
-        const double m_pi = 0.13957;
-        double mT = sqrt(kT_mean*kT_mean + m_pi*m_pi);
-        double fit_max = sqrt(2500.0/mT);
-
-        bool shapeStored = false;
-        const double NaN = std::numeric_limits<double>::quiet_NaN();
+    bool shapeStored = false;
+    HBTResults res1mm = {nullptr, nullptr, nullptr, nullptr, 0};
+    HBTResults res_full = {nullptr, nullptr, nullptr, nullptr, 0};
 
         for (auto& lc : rhoLambdaCutoffs) {
             const string& label = lc.first;
             const double rhoLamMax = lc.second;
 
-            FitResult fit = RunLevyFit(res, fit_min, fit_max, mT, rhoLamMax);
+            //FitResult fit = RunLevyFit(res, fit_min, fit_max, mT, rhoLamMax);
             
-            // Fix: preserve output-vector alignment when a fit fails.
-if (!fit.ok) {
+            HBTResults resC = FillFromCache(pairCache[ibin], all_event_ids, rhoLamMax);
+FitResult fit{};
+if (resC.total_pairs >= 100)
+    fit = RunLevyFit(resC, fit_min, fit_max, mT, rhoLamMax);
 
-    cout << "  " << label
-         << ": fit rejected (status "
-         << fit.status << ")\n";
+            if (!fit.ok) {
+                FreeHBT(resC);
+                cout << "  " << label << ": fit rejected (status "
+                     << fit.status << ")\n";
+                if (fit.boundaryReject) {
+                    cout << "  [fit rejected: parameter at boundary Rout="
+                         << fit.Rout << " Rside=" << fit.Rside
+                         << " Rlong=" << fit.Rlong << "]\n";
+                }
 
-    if (fit.boundaryReject) {
-        cout << "  [fit rejected: parameter at boundary Rout="
-             << fit.Rout
-             << " Rside=" << fit.Rside
-             << " Rlong=" << fit.Rlong << "]\n";
-    }
+                if (label == "1mm") break;
 
-    // If the nominal 1mm fit fails, reject this entire kT bin.
-    // Do not push entries into any output vectors for this bin.
-    if (label == "1mm") {
-        break;
-    }
-
-    // A later cutoff failed, but the nominal 1mm fit succeeded.
-    // Record NaN only for the failed cutoff.
-    lambda_by_cutoff[label].push_back(NaN);
-    lambda_err_by_cutoff[label].push_back(NaN);
-
-    // Essential: do not process the failed fit below.
-    continue;
+                lambda_by_cutoff[label].push_back(NaN);
+                lambda_err_by_cutoff[label].push_back(NaN);
+                continue;
+            }
+               if (label == "1mm") res1mm = resC;             // keep for the D(rho) plots
+        else                FreeHBT(resC);
+        
+        // Independent full-range sample for the allRange display; not used in fits.
+if (label == "1mm") {
+    res_full = FillFromCache(pairCache[ibin], all_event_ids, 1.0e15);
 }
+    
 
             const double CL = (fit.ndf > 0) ? TMath::Prob(fit.deviance, fit.ndf) : 0.0;
 
@@ -1791,22 +1962,13 @@ if (!fit.ok) {
                     cout << "    " << dirs[d] << ": D = " << fit.devProj[d]
                          << ", obs = " << fit.obsProj[d] << ", exp = " << fit.expProj[d] << "\n";
 
-                /*BootstrapResult boot;
-                if (total_events > 1)
-                    boot = RunEventBootstrap(eventsByID, all_event_ids,
-                                             kT_min, kT_max,
-                                             fit_min, fit_max, mT, rhoLamMax,
-                                             fit.deviance, ibin, nBootstrap);*/
-                                             
-                              const double nomPar[5] = {fit.alpha, fit.Rout, fit.Rside,
+                const double nomPar[5] = {fit.alpha, fit.Rout, fit.Rside,
                                           fit.Rlong, fit.lambda};
                 BootstrapResult boot;
                 if (total_events > 1)
-                    boot = RunEventBootstrap(eventsByID, all_event_ids,
-                                             kT_min, kT_max,
+                    boot = RunEventBootstrap(pairCache, all_event_ids, ibin,
                                              fit_min, fit_max, mT, rhoLamMax,
                                              fit.deviance, nomPar, ibin, nBootstrap);
-
 
                 alpha_bootErr.push_back(BootstrapRMS(boot.alpha));
                 Rout_bootErr.push_back(BootstrapRMS(boot.Rout));
@@ -1823,7 +1985,11 @@ if (!fit.ok) {
             }
         }
 
-        // --- Plot using the 1mm fit result ---
+        // Uncut display sample: built once per bin, after all four fits have run.
+        if (shapeStored)
+            res_full = FillFromCache(pairCache[ibin], all_event_ids, 1.0e15);
+            
+        // ---- Per-bin D(rho) plots ----
         if (shapeStored) {
             int idx = mt_vals.size() - 1;
             double alpha = alpha_vals[idx];
@@ -1832,24 +1998,25 @@ if (!fit.ok) {
             double Rlong = Rlong_vals[idx];
             double lam   = lambda_by_cutoff["1mm"].back();
 
-            auto drawCanvas = [&](double xDisplayMin, double xDisplayMax,
-                                   bool showTail, const char* fileSuffix) {
+           
+          auto drawCanvas = [&](const HBTResults& res_plot, double xDisplayMin, 
+          double xDisplayMax, bool showTail, const char* fileSuffix) {
 
-                TCanvas* c = new TCanvas(Form("c_%d_%s", ibin, fileSuffix),
+                               TCanvas* c = new TCanvas(Form("c_%d_%s", ibin, fileSuffix),
                                          Form("kT: %.2f-%.2f GeV/c, N_{pairs} = %d",
-                                              kT_min, kT_max, res.total_pairs),
+                                              kT_min, kT_max, res_plot.total_pairs),
                                          2500, 850);
 
                 double padWidth = 1.0/3.0;
                 TPad* pad1 = new TPad("pad1", "", 0.0*padWidth, 0.0, 1.0*padWidth, 1.0);
                 TPad* pad2 = new TPad("pad2", "", 1.0*padWidth, 0.0, 2.0*padWidth, 1.0);
                 TPad* pad3 = new TPad("pad3", "", 2.0*padWidth, 0.0, 3.0*padWidth, 1.0);
-                pad1->Draw();
-                pad2->Draw();
-                pad3->Draw();
+                pad1->Draw(); pad2->Draw(); pad3->Draw();
                 TPad* pads[3] = {pad1, pad2, pad3};
 
-                TH1F* hdir[3] = {res.hOut, res.hSide, res.hLong};
+                //TH1F* hdir[3] = {res.hOut, res.hSide, res.hLong};
+                TH1F* hdir[3] = {res_plot.hOut, res_plot.hSide, res_plot.hLong};
+                //TH1F* hdir[3] = {res1mm.hOut, res1mm.hSide, res1mm.hLong};
                 const char* names[3] = {"out", "side", "long"};
 
                 for (int idir = 0; idir < 3; ++idir) {
@@ -1874,14 +2041,16 @@ if (!fit.ok) {
                         Form("h_%s_%s_%d", names[idir], fileSuffix, ibin));
                     h->SetDirectory(0);
 
-                    const double rho_lambda_max = 1.0e12;
+                    /*const double rho_lambda_max = 1.0e12;
                     int lastNormBin = h->FindBin(rho_lambda_max);
                     if (lastNormBin > h->GetNbinsX())
                         lastNormBin = h->GetNbinsX();
 
-                    const double norm = h->Integral(1, lastNormBin);
-                    if (norm > 0.0)
-                        h->Scale(1.0 / norm, "width");
+                    const double norm = h->Integral(0, lastNormBin);
+                    if (norm > 0.0) h->Scale(1.0 / norm, "width");*/
+                    
+                    const double norm = static_cast<double>(res_plot.total_pairs);
+                    if (norm > 0.0) h->Scale(1.0 / norm, "width");
 
                     const double rho_min = 0.1;
                     const double lambda1mmCutoff = 1.0e12;
@@ -1906,9 +2075,7 @@ if (!fit.ok) {
                     h->GetYaxis()->SetTitleOffset(0);
                     h->GetYaxis()->SetTickLength(0.03);
 
-                    if (idir != 0) {
-                        h->GetYaxis()->SetLabelSize(0);
-                    }
+                    if (idir != 0) h->GetYaxis()->SetLabelSize(0);
 
                     h->GetXaxis()->SetTitle(Form("#rho_{%s} [fm]", names[idir]));
                     h->GetXaxis()->SetTitleSize(0.075);
@@ -1932,12 +2099,11 @@ if (!fit.ok) {
                     }
 
                     h->GetXaxis()->ChangeLabel(-1, -1, -1, -1, -1, -1, " ");
-                    if (idir != 0) {
+                    if (idir != 0)
                         h->GetXaxis()->ChangeLabel(1, -1, -1, -1, -1, -1, " ");
-                    }
 
                     double R_par[3] = {Rout, Rside, Rlong};
-                    double par[3] = {alpha, R_par[idir], lam};
+                    double par[3]   = {alpha, R_par[idir], lam};
 
                     TF1* flevyFit = new TF1(Form("fFit_%s_%d_%s", names[idir], ibin, fileSuffix),
                                             LevyProj1DFunc, fit_min, fit_max, 3);
@@ -2029,13 +2195,18 @@ if (!fit.ok) {
                 delete c;
             };
 
-            drawCanvas(0.1, 1.0e15,  /*showTail=*/true,  "allRange");
-            drawCanvas(0.1, fit_max, /*showTail=*/false, "coreFit");
+            //drawCanvas(0.1, 1.0e15,  true,  "allRange");
+            //drawCanvas(0.1, fit_max, false, "coreFit");
+            
+            drawCanvas(res_full, 0.1, 1.0e15,  true,  "allRange");
+            drawCanvas(res1mm,  0.1, fit_max, false, "coreFit");
         }
-    }   
+                FreeHBT(res1mm);
+                        FreeHBT(res_full);
+    }
 
     // ============================================================
-    // Summary canvas: mT dependence
+    // Summary canvas
     // ============================================================
     TCanvas *c_mT = new TCanvas("c_mT", "Fit Parameters vs m_T", 2000, 1500);
     c_mT->Divide(2, 2);
@@ -2062,14 +2233,12 @@ if (!fit.ok) {
 
     int nPoints = mt_vals.size();
 
-    // Fix 3: symmetrized bootstrap half-width for the summary plot
     std::vector<double> lambda_bootSym;
     for (size_t i = 0; i < lambda_bootLo.size(); ++i)
         lambda_bootSym.push_back(0.5 * (lambda_bootLo[i] + lambda_bootHi[i]));
 
-    // --- Pad 1: alpha (Fix 3 errors + Fix 5 y-range) ----------
+    // ---- Pad 1: alpha ----
     c_mT->cd(1);
-
     TGraphErrors *gAlpha = new TGraphErrors(nPoints,
         &mt_vals[0], &alpha_vals[0],
         &mt_err[0],  &alpha_bootErr[0]);
@@ -2077,14 +2246,9 @@ if (!fit.ok) {
     gAlpha->SetMarkerStyle(23);
     gAlpha->SetMarkerSize(1.4);
     gAlpha->SetMarkerColor(kBlack);
-
-    // Fix 5: data-driven y-range
     SetDataDrivenYRange(gAlpha, alpha_vals, 0.10);
-
     gAlpha->Draw("APE");
-
     gPad->Update();
-
     gAlpha->GetXaxis()->SetLabelSize(0.075);
     gAlpha->GetYaxis()->SetLabelSize(0.075);
     gAlpha->GetXaxis()->SetTitleSize(0.080);
@@ -2092,37 +2256,29 @@ if (!fit.ok) {
     gAlpha->GetXaxis()->SetTitleOffset(0.95);
     gAlpha->GetYaxis()->SetTitleOffset(0.90);
 
-    // --- Pad 2: HBT radii ----------------------------------------------
+    // ---- Pad 2: radii ----
     c_mT->cd(2);
-
-    TGraphErrors *gRout = new TGraphErrors(nPoints, &mt_vals[0], &Rout_vals[0],
-                                           &mt_err[0],  &Rout_bootErr[0]);
-    gRout->SetMarkerStyle(23);
-    gRout->SetMarkerSize(1.4);
-    gRout->SetMarkerColor(kRed);
-    gRout->SetLineColor(kRed);
+    TGraphErrors *gRout  = new TGraphErrors(nPoints, &mt_vals[0], &Rout_vals[0],
+                                            &mt_err[0],  &Rout_bootErr[0]);
+    gRout->SetMarkerStyle(23); gRout->SetMarkerSize(1.4);
+    gRout->SetMarkerColor(kRed); gRout->SetLineColor(kRed);
     gRout->SetTitle("HBT radii vs m_{T}; m_{T} [GeV/c^{2}]; R [fm]");
 
     TGraphErrors *gRside = new TGraphErrors(nPoints, &mt_vals[0], &Rside_vals[0],
                                             &mt_err[0],  &Rside_bootErr[0]);
-    gRside->SetMarkerStyle(25);
-    gRside->SetMarkerSize(1.4);
-    gRside->SetMarkerColor(kBlue);
-    gRside->SetLineColor(kBlue);
+    gRside->SetMarkerStyle(25); gRside->SetMarkerSize(1.4);
+    gRside->SetMarkerColor(kBlue); gRside->SetLineColor(kBlue);
 
     TGraphErrors *gRlong = new TGraphErrors(nPoints, &mt_vals[0], &Rlong_vals[0],
                                             &mt_err[0],  &Rlong_bootErr[0]);
-    gRlong->SetMarkerStyle(25);
-    gRlong->SetMarkerSize(1.4);
-    gRlong->SetMarkerColor(kGreen+2);
-    gRlong->SetLineColor(kGreen+2);
+    gRlong->SetMarkerStyle(25); gRlong->SetMarkerSize(1.4);
+    gRlong->SetMarkerColor(kGreen+2); gRlong->SetLineColor(kGreen+2);
 
     gRout->GetHistogram()->GetYaxis()->SetRangeUser(1.0, 15.0);
     gRout->Draw("APE");
     gRside->Draw("P SAME");
     gRlong->Draw("P SAME");
     gPad->Update();
-
     gRout->GetXaxis()->SetLabelSize(0.075);
     gRout->GetYaxis()->SetLabelSize(0.075);
     gRout->GetXaxis()->SetTitleSize(0.080);
@@ -2139,9 +2295,8 @@ if (!fit.ok) {
     legRadii->AddEntry(gRlong, "R_{long}", "P");
     legRadii->Draw();
 
-    // --- Pad 3: lambda (Fix 3 symmetrized percentile + Fix 5 y-range) -
+    // ---- Pad 3: lambda ----
     c_mT->cd(3);
-
     if ((int)lambda_bootSym.size() == nPoints) {
         TGraphErrors* gLambda = new TGraphErrors(nPoints,
             &mt_vals[0], &lambda_by_cutoff["1mm"][0],
@@ -2151,13 +2306,9 @@ if (!fit.ok) {
         gLambda->SetMarkerColor(kBlack);
         gLambda->SetLineColor(kBlack);
         gLambda->SetTitle("#lambda_{1mm} vs m_{T}; m_{T} [GeV/c^{2}]; #lambda_{1mm}");
-
-        // Fix 5: data-driven y-range
         SetDataDrivenYRange(gLambda, lambda_by_cutoff["1mm"], 0.10);
-
         gLambda->Draw("APE");
         gPad->Update();
-
         gLambda->GetXaxis()->SetLabelSize(0.075);
         gLambda->GetYaxis()->SetLabelSize(0.075);
         gLambda->GetXaxis()->SetTitleSize(0.080);
@@ -2166,20 +2317,17 @@ if (!fit.ok) {
         gLambda->GetYaxis()->SetTitleOffset(0.90);
     }
 
-    // --- Pad 4: system information -------------------------------------
+    // ---- Pad 4: system info ----
     c_mT->cd(4);
-
     TPaveText *sysInfo = new TPaveText(0.06, 0.06, 0.94, 0.94, "NDC");
     sysInfo->SetFillStyle(0);
     sysInfo->SetBorderSize(2);
     sysInfo->SetTextFont(42);
     sysInfo->SetTextAlign(12);
-
     sysInfo->SetTextSize(0.075);
     sysInfo->AddText(Form("%s, #sqrt{s_{NN}} = %.0f GeV",
                           collision_system, sqrt_sNN));
     sysInfo->AddText(Form("Centrality: %s", centrality));
-
     sysInfo->SetTextSize(0.065);
     sysInfo->AddText(" ");
     sysInfo->AddText("Kinematics Cut:");
@@ -2188,7 +2336,6 @@ if (!fit.ok) {
     sysInfo->AddText(Form("#rho_{max}^{#lambda} = 1 mm"));
     sysInfo->Draw();
 
-    // --- Save ----------------------------------------------------------
     c_mT->SaveAs("Proj3D_FitParameters_vs_mT.png");
 
     {
@@ -2197,7 +2344,7 @@ if (!fit.ok) {
         fout.Close();
     }
 
-    // --- CSV: fit parameters + lambda per cutoff + bootstrap columns ---
+    // ---- CSV ----
     std::ofstream csv("Levy_fit_parameters_vs_kT.csv");
     csv << std::setprecision(10);
     csv << "kT_min,kT_max,kT_mean,mT,"
@@ -2207,15 +2354,14 @@ if (!fit.ok) {
     csv << ",alpha_bootErr,Rout_bootErr,Rside_bootErr,Rlong_bootErr,lambda_bootErr,"
            "lambda_bootLo,lambda_bootHi,alpha_bootLo,alpha_bootHi";
 
-    for (auto& lc : rhoLambdaCutoffs) {
+    for (auto& lc : rhoLambdaCutoffs)
         csv << "," << lc.first << "_lambda," << lc.first << "_lambda_err";
-    }
     csv << "\n";
 
     for (int i = 0; i < nPoints; ++i) {
         double kT_min = kTlo_vals[i];
         double kT_max = kThi_vals[i];
-        double kT_mean = 0.5*(kT_min + kT_max);
+        double kT_mean = 0.5 * (kT_min + kT_max);
 
         csv << kT_min << "," << kT_max << "," << kT_mean << "," << mt_vals[i] << ","
             << alpha_vals[i] << "," << alpha_err[i] << ","
@@ -2240,4 +2386,4 @@ if (!fit.ok) {
     }
     csv.close();
     std::cout << "Fit parameters written to Levy_fit_parameters_vs_kT.csv\n";
-}  
+}
