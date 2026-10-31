@@ -17,6 +17,7 @@
 #include <tuple>
 #include <sstream>
 #include <iomanip>
+#include <array>
 #include <TRandom3.h>
 #include <algorithm>
 #include "Levy_proj_reader.h"
@@ -66,7 +67,6 @@ double IntegralLevyBin(double alpha, double R, double lambda,
     return sum * dx / 3.0;
 }
 
-// forward declaration (definition is below)
 int CountFitBins(TH1* h, double fitMin, double fitMax);
 
 // ===============================
@@ -78,12 +78,17 @@ struct Particle {
     Int_t   charge;
     Int_t   ID;
 
+    bool atEndForcedDecay   = false;
+    bool emissionUnresolved = false;
+    bool decayedByUs        = false;
+
     Double_t px, py, pz, E;
     Double_t x,  y,  z,  t;
-    Double_t xf, yf, zf, tf;
-    Double_t time_last_coll;
+    Double_t xf = 0, yf = 0, zf = 0, tf = 0;
+    Double_t time_last_coll = 0;
     Int_t    ncoll = 0;
     Double_t form_time = 0.0;
+    int emissionOrigin = 0;   // 0 = default, 1 = history, 2 = eta fallback, 3 = weak forced, 4 = corrected end
     Int_t    proc_type;
     Int_t    proc_id_origin;
 
@@ -94,8 +99,8 @@ struct Particle {
     Double_t betaY() const { return py / E; }
     Double_t betaZ() const { return pz / E; }
 
-    Int_t mom1;
-    Int_t mom2;
+    Int_t mom1 = 0;
+    Int_t mom2 = 0;
 
     Int_t ensemble_id = 0;
     Int_t historyParentID  = 0;
@@ -131,10 +136,53 @@ ParticleKey MakeKey(const Particle& p)
     return k;
 }
 
+// ===============================
+// Particle/decay tables
+// ===============================
+struct ParticleInfo { std::string name; double mass; double width; std::vector<int> pdgs; };
+struct DecayChannel { double br; int L; std::vector<std::string> daughters; };
+
+std::unordered_map<int, std::vector<DecayChannel>> decayTable;
+std::unordered_map<int, ParticleInfo> particleTable;
+std::unordered_map<std::string, int> nameToPDG;
+
+// Global set of event IDs that appear in the history file (populated by the parser).
+std::set<int> gHistEventIds;
+
+// Parent-side decay record for each SMASH interaction block: keyed by parent id.
+struct ParentDecayRec {
+    double t            = 0.0;
+    bool   hasChargedPion = false;
+};
+std::map<ParticleKey, ParentDecayRec> gParentDecay;
+
+constexpr double hbarc = 0.1973269804; // GeV fm
+TRandom3 rng(0);
+
+double properLifetimeFmC(double widthGeV) {
+    if (widthGeV <= 0.0) return 0.0;
+    return hbarc / widthGeV;
+}
+
+double sampleDecayProperTime(double tau0) {
+    if (!(tau0 > 0.0)) return -1.0;
+    return -tau0 * std::log(rng.Uniform());
+}
+
+double lifetimeFromPDG(int pdg) {
+    pdg = std::abs(pdg);
+    auto it = particleTable.find(pdg);
+    if (it == particleTable.end()) return 0.0;
+    return properLifetimeFmC(it->second.width);
+}
+
+static std::map<ParticleKey, std::array<double,4>> gCorrectedVertex;
+
 struct ProductionInfo {
-    int parentID  = 0;
-    int parentPDG = 0;
-    double x = 0.0, y = 0.0, z = 0.0, t = 0.0;
+    int    parentID = 0, parentPDG = 0;
+    double x = 0, y = 0, z = 0, t = 0;
+    bool   atEndForced = false;
+    bool   correctionOK = false;
 };
 
 enum class SourceType { Direct, Core, Halo };
@@ -307,24 +355,25 @@ static bool ParseHistoryLine(const std::string& line, HistoryLine& hp)
     return !ss.fail();
 }
 
+const double kTEnd    = 300.0;
+const double kTEndTol = 1.0e-3;
+bool gApplyEndShift = true;
+
 void LoadDecayVertices(const char* fname,
                        std::map<ParticleKey, ProductionInfo>& productionMap)
 {
     std::ifstream fin(fname);
-    if (!fin.is_open()) {
-        std::cerr << "Cannot open " << fname << " -- skipping\n";
-        return;
-    }
+    if (!fin.is_open()) { std::cerr << "Cannot open " << fname << " -- skipping\n"; return; }
 
     std::string line;
-    int event_id    = -1;
-    int ensemble_id = 0;
-
+    int event_id = -1, ensemble_id = 0;
     bool inBlock = false;
-    int nIn = 0, nOut = 0;
-    int readIn = 0, readOut = 0;
-    std::vector<HistoryLine> incoming;
-    long nBlocks = 0;
+    int nIn = 0, nOut = 0, readIn = 0, readOut = 0;
+    long nBadLines = 0, nIncomplete = 0;
+    std::vector<HistoryLine> incoming, outgoing;
+    long nBlocks = 0, nForced = 0, nCorr = 0, nUnres = 0;
+    std::map<int, long> forcedByParent, unresByParent;
+    std::map<int, std::vector<double>> shiftByParent;
 
     while (std::getline(fin, line)) {
         if (line.empty()) continue;
@@ -332,24 +381,24 @@ void LoadDecayVertices(const char* fname,
         if (line[0] == '#') {
             if (line.find("event") != std::string::npos &&
                 line.find("ensemble") != std::string::npos) {
-                std::stringstream ss(line);
-                std::string tok;
+                std::stringstream ss(line); std::string tok;
                 while (ss >> tok) {
-                    if (tok == "event")         ss >> event_id;
+                    if (tok == "event") ss >> event_id;
                     else if (tok == "ensemble") ss >> ensemble_id;
                 }
-                inBlock = false;
-                continue;
+                if (event_id >= 0) gHistEventIds.insert(event_id);
+                inBlock = false; continue;
             }
             if (line.find("interaction") != std::string::npos) {
-                std::stringstream ss(line);
-                std::string tok;
+                if (inBlock) ++nIncomplete;
+
+                std::stringstream ss(line); std::string tok;
                 nIn = 0; nOut = 0;
                 while (ss >> tok) {
-                    if (tok == "in")       ss >> nIn;
+                    if (tok == "in") ss >> nIn;
                     else if (tok == "out") ss >> nOut;
                 }
-                incoming.clear();
+                incoming.clear(); outgoing.clear();
                 readIn = 0; readOut = 0;
                 inBlock = (nIn > 0);
                 if (inBlock) nBlocks++;
@@ -359,42 +408,120 @@ void LoadDecayVertices(const char* fname,
         }
 
         HistoryLine hp;
-        if (!ParseHistoryLine(line, hp)) continue;
+        if (!ParseHistoryLine(line, hp)) {
+            if (inBlock) ++nBadLines;
+            continue;
+        }
 
         if (inBlock && readIn < nIn) {
-            incoming.push_back(hp);
-            readIn++;
+            incoming.push_back(hp); readIn++;
             if (readIn == nIn && nOut == 0) inBlock = false;
             continue;
         }
+        if (!(inBlock && readIn == nIn && readOut < nOut)) continue;
 
-        if (inBlock && readIn == nIn && readOut < nOut) {
-            ParticleKey key{event_id, ensemble_id, hp.ID};
+        outgoing.push_back(hp); readOut++;
+        if (readOut < nOut) continue;
+        inBlock = false;
+
+        // --- block complete ---
+        const bool oneParent = (nIn == 1);
+        bool forcedEnd = oneParent && (nOut >= 2);
+        for (const auto& o : outgoing)
+            if (std::fabs(o.t - kTEnd) > kTEndTol ) { forcedEnd = false; break; }
+
+        // Parent-side decay record (for eta parent-side coverage test)
+        if (oneParent) {
+            bool charged = false;
+            for (const auto& o : outgoing) if (std::abs(o.pdg) == 211) charged = true;
+            gParentDecay[ParticleKey{event_id, ensemble_id, incoming[0].ID}] =
+                ParentDecayRec{ incoming[0].t, charged };
+        }
+
+        double sx = 0, sy = 0, sz = 0, st = 0;
+        double ox = 0, oy = 0, oz = 0, ot = 0;
+
+        bool corrOK = false;
+        if (forcedEnd) {
+            const HistoryLine& par = incoming[0];
+            ox = par.x; oy = par.y; oz = par.z; ot = par.t;
+            auto cit = gCorrectedVertex.find(ParticleKey{event_id, ensemble_id, par.ID});
+            if (cit != gCorrectedVertex.end()) {
+                ox = cit->second[0]; oy = cit->second[1]; oz = cit->second[2]; ot = cit->second[3];
+            }
+            auto pt = particleTable.find(std::abs(par.pdg));
+            if (pt != particleTable.end() && pt->second.width > 0.0 &&
+                par.mass > 0.0 && par.p0 >= par.mass) {
+                const double ctau = properLifetimeFmC(pt->second.width);
+                double u = gRandom->Rndm(); if (u <= 0.0) u = 1.0e-12;
+                st = (par.p0 / par.mass) * (-ctau * std::log(u));
+                sx = par.px / par.p0 * st;
+                sy = par.py / par.p0 * st;
+                sz = par.pz / par.p0 * st;
+                corrOK = true;
+                shiftByParent[std::abs(par.pdg)].push_back(st);
+            }
+        }
+
+        if (!gApplyEndShift) { st = sx = sy = sz = 0.0; }
+
+        for (const auto& o : outgoing) {
+            ParticleKey key{event_id, ensemble_id, o.ID};
             ProductionInfo info;
-            info.x = hp.x; info.y = hp.y; info.z = hp.z; info.t = hp.t;
+            info.x = o.x; info.y = o.y; info.z = o.z; info.t = o.t;
 
-            if (nIn == 1) {
+            if (oneParent) {
                 info.parentID  = incoming[0].ID;
                 info.parentPDG = incoming[0].pdg;
             } else {
-                int candidatePDG = hp.pdg_mother1 != 0 ? hp.pdg_mother1 : hp.pdg_mother2;
-                info.parentPDG = candidatePDG;
+                int cand = o.pdg_mother1 != 0 ? o.pdg_mother1 : o.pdg_mother2;
+                info.parentPDG = cand;
                 info.parentID  = 0;
                 int nMatches = 0;
-                for (const auto& in_p : incoming)
-                    if (in_p.pdg == candidatePDG) { info.parentID = in_p.ID; nMatches++; }
+                for (const auto& ip : incoming)
+                    if (ip.pdg == cand) { info.parentID = ip.ID; nMatches++; }
                 if (nMatches != 1) info.parentID = 0;
             }
-
+            if (forcedEnd) {
+                ++nForced; ++forcedByParent[std::abs(info.parentPDG)];
+                info.atEndForced = true;
+                if (corrOK) {
+                    info.x = ox + sx; info.y = oy + sy;
+                    info.z = oz + sz; info.t = ot + st;
+                    info.correctionOK = true; ++nCorr;
+                    gCorrectedVertex[key] = {info.x, info.y, info.z, info.t};
+                } else {
+                    ++nUnres; ++unresByParent[std::abs(info.parentPDG)];
+                }
+            }
+            auto itExisting = productionMap.find(key);
+            if (itExisting != productionMap.end() &&
+                itExisting->second.t <= info.t) continue;
             productionMap[key] = info;
-            readOut++;
-            if (readOut == nOut) inBlock = false;
-            continue;
         }
+        incoming.clear(); outgoing.clear();
     }
 
+    if (inBlock) ++nIncomplete;
+
     std::cout << "Parsed " << nBlocks << " interaction blocks from " << fname
-              << " -> " << productionMap.size() << " daughter vertex records\n";
+              << " -> " << productionMap.size() << " daughter vertex records\n"
+              << "  forced end-of-run daughters: " << nForced
+              << "  corrected: " << nCorr
+              << "  unresolved: " << nUnres
+              << "  bad lines: " << nBadLines
+              << "  incomplete blocks: " << nIncomplete << "\n";
+    for (auto& kv : forcedByParent) {
+        auto& v = shiftByParent[kv.first];
+        double med = 0;
+        if (!v.empty()) { std::sort(v.begin(), v.end()); med = v[v.size() / 2]; }
+        std::cout << "    parent PDG " << kv.first << ": " << kv.second
+                  << " daughters, unresolved " << unresByParent[kv.first]
+                  << ", median gamma*tau = " << med << " fm\n";
+        auto pt = particleTable.find(kv.first);
+        std::cout << "      width " << (pt != particleTable.end() ? pt->second.width : 0.0)
+                  << " GeV, ctau " << (pt != particleTable.end() ? properLifetimeFmC(pt->second.width) : 0.0) << " fm\n";
+    }
 }
 
 void MatchHistoryVertices(std::vector<Particle>& particles,
@@ -412,15 +539,86 @@ void MatchHistoryVertices(std::vector<Particle>& particles,
         p.historyParentID  = it->second.parentID;
         p.historyParentPDG = it->second.parentPDG;
         p.hasHistoryProductionVertex = true;
+
+        if (it->second.atEndForced)                     p.atEndForcedDecay   = true;
+        if (it->second.atEndForced && !it->second.correctionOK)
+            p.emissionUnresolved = true;
         matched++;
     }
     std::cout << "Matched " << matched << " / " << particles.size()
               << " final-state particles to history vertices\n";
 }
 
-// =========================================
+void PrintHistoryCensus(const std::vector<Particle>& particles)
+{
+    std::map<int, std::array<long,4>> evCensus;   // [total, matched, unmatched&ncoll>0, unmatched&mom!=0]
+    long tot[4] = {0,0,0,0};
+    long unmatchedNone = 0;
+    for (const auto& p : particles) {
+        if (std::abs(p.pid) != 211) continue;
+        auto& c = evCensus[p.event_id];
+        c[0]++;
+        if (p.hasHistoryProductionVertex)                 c[1]++;
+        else if (p.ncoll > 0)                             c[2]++;
+        else if (p.mom1 != 0 || p.mom2 != 0)              c[3]++;
+        else { c[3]++; unmatchedNone++; }
+    }
+    for (auto& kv : evCensus)
+        for (int i = 0; i < 4; ++i) tot[i] += kv.second[i];
+    std::cout << "Charged pions: " << tot[0]
+              << "  history-matched: " << tot[1]
+              << " (" << (tot[0] ? 100.0 * tot[1] / tot[0] : 0.0) << "%)"
+              << "  unmatched, ncoll>0: " << tot[2]
+              << "  unmatched, motherPDG!=0: " << (tot[3] - unmatchedNone)
+              << "  unmatched, neither: " << unmatchedNone << "\n";
+    int evNoMatch = 0;
+    for (auto& kv : evCensus) if (kv.second[0] > 0 && kv.second[1] == 0) evNoMatch++;
+    std::cout << "Events with zero matched pions: " << evNoMatch << "\n";
+
+    long   nEvents        = 0;
+    long   sumUnmatched   = 0;
+    long   minUnmatched   = std::numeric_limits<long>::max();
+    long   maxUnmatched   = 0;
+    for (auto& kv : evCensus) {
+        if (kv.second[0] == 0) continue;
+        const long u = kv.second[2];
+        ++nEvents;
+        sumUnmatched += u;
+        if (u < minUnmatched) minUnmatched = u;
+        if (u > maxUnmatched) maxUnmatched = u;
+    }
+    if (nEvents > 0) {
+        if (minUnmatched == std::numeric_limits<long>::max()) minUnmatched = 0;
+        std::cout << "Unmatched interacted pions per event: mean "
+                  << (double(sumUnmatched) / double(nEvents))
+                  << "  min " << minUnmatched
+                  << "  max " << maxUnmatched
+                  << "  (over " << nEvents << " events)\n";
+    }
+}
+
+// Write per-event census to a file for reproducibility / plotting.
+void WriteEventCensus(const std::vector<Particle>& particles, const char* fname)
+{
+    std::map<int, std::array<long,4>> c;   // pions, matched, unmatched_interacted, unmatched_nocoll
+    for (const auto& p : particles) {
+        if (std::abs(p.pid) != 211) continue;
+        auto& a = c[p.event_id]; ++a[0];
+        if (p.hasHistoryProductionVertex) ++a[1];
+        else if (p.ncoll > 0 || p.mom1 != 0 || p.mom2 != 0) ++a[2];
+        else ++a[3];
+    }
+    std::ofstream f(fname);
+    f << "event_id pions matched unmatched_interacted unmatched_nocoll in_history_file\n";
+    for (auto& kv : c)
+        f << kv.first << " " << kv.second[0] << " " << kv.second[1] << " "
+          << kv.second[2] << " " << kv.second[3] << " "
+          << (gHistEventIds.count(kv.first) ? 1 : 0) << "\n";
+}
+
+// ---------------------------
 // Configuration
-// =========================================
+// ---------------------------
 const char* collision_system = "Au+Au";
 const char* centrality       = "0-5%";
 double sqrt_sNN = 200;
@@ -429,9 +627,6 @@ double pT_min  = 0.15;
 double pT_max  = 1.0;
 double eta_cut = 1.0;
 
-// ===============================
-// HBTResults
-// ===============================
 struct HBTResults {
     TH1F* hOut;
     TH1F* hSide;
@@ -440,102 +635,6 @@ struct HBTResults {
     int total_pairs;
 };
 
-HBTResults AnalyzePairs(const std::vector<Particle>& particles,
-                        double kT_min,
-                        double kT_max,
-                        bool useCoreOnly = false)
-{
-    std::map<int, std::vector<Particle>> events;
-    for (const auto& p : particles) {
-        if (std::abs(p.pid) != 211) continue;
-        if (useCoreOnly && classifyPionSource(p) == SourceType::Halo)
-            continue;
-        events[p.event_id].push_back(p);
-    }
-
-    const int n_bins = 300;
-    const double rho_min = 0.1;
-    const double rho_max = 1.0e15;
-    double bins[n_bins + 1];
-    const double logStep = std::pow(rho_max / rho_min, 1.0 / n_bins);
-    bins[0] = rho_min;
-    for (int i = 1; i <= n_bins; ++i) bins[i] = bins[i-1] * logStep;
-
-    TH1F* hRho  = new TH1F("hRho",  "D(#rho)", n_bins, bins);
-    TH1F* hOut  = new TH1F("hOut",  "", n_bins, bins);
-    TH1F* hSide = new TH1F("hSide", "", n_bins, bins);
-    TH1F* hLong = new TH1F("hLong", "", n_bins, bins);
-    hRho->Sumw2(); hOut->Sumw2(); hSide->Sumw2(); hLong->Sumw2();
-
-    int pairs_count = 0;
-    for (auto& ev : events) {
-        const auto& v = ev.second;
-        for (size_t i = 0; i < v.size(); ++i) {
-            const Particle& p1 = v[i];
-            if (p1.pT() < pT_min || p1.pT() > pT_max) continue;
-            if (fabs(p1.eta()) > eta_cut) continue;
-
-            for (size_t j = i + 1; j < v.size(); ++j) {
-                const Particle& p2 = v[j];
-                if (p2.pT() < pT_min || p2.pT() > pT_max) continue;
-                if (fabs(p2.eta()) > eta_cut) continue;
-                if (p1.pid != p2.pid) continue;
-
-                double kx = 0.5 * (p1.px + p2.px);
-                double ky = 0.5 * (p1.py + p2.py);
-                double kz = 0.5 * (p1.pz + p2.pz);
-                double kT = TMath::Sqrt(kx*kx + ky*ky);
-                if (kT < kT_min || kT >= kT_max) continue;
-                if (!(kT > 0.0) || !std::isfinite(kT)) continue;
-
-                const double mpi = 0.13957;
-                double mT    = sqrt(kT*kT + mpi*mpi);
-                double qmCut = sqrt(0.2 * mT);
-
-                double qx    = p1.px - p2.px;
-                double qy    = p1.py - p2.py;
-                double qzL   = (4*pow((p1.pz*p2.E - p2.pz*p1.E),2)) /
-                               (pow((p1.E+p2.E),2) - pow((p1.pz+p2.pz),2));
-                double qLCMS = TMath::Sqrt(qx*qx + qy*qy + qzL);
-                if (qLCMS > qmCut) continue;
-
-                double dx = p1.xf - p2.xf;
-                double dy = p1.yf - p2.yf;
-                double dz = p1.zf - p2.zf;
-                double dt = p1.tf - p2.tf;
-
-                double K0  = 0.5 * (p1.E + p2.E);
-                double kp  = K0*K0 - kz*kz;
-                double phi = atan2(ky, kx);
-                if (!(kp > 0.0) || !std::isfinite(kp)) continue;
-
-                double r_out  = TMath::Cos(phi)*dx + TMath::Sin(phi)*dy
-                              - (kT/kp)*(K0*dt - kz*dz);
-                double r_side = -TMath::Sin(phi)*dx + TMath::Cos(phi)*dy;
-                double r_long = (K0*dz - kz*dt) / sqrt(kp);
-                double rho    = sqrt(r_out*r_out + r_side*r_side + r_long*r_long);
-                if (!std::isfinite(r_out) || !std::isfinite(r_side) ||
-                    !std::isfinite(r_long) || !std::isfinite(rho)) continue;
-
-                pairs_count++;
-
-                hRho->Fill(rho);
-                hOut->Fill(fabs(r_out));
-                hSide->Fill(fabs(r_side));
-                hLong->Fill(fabs(r_long));
-            }
-        }
-    }
-
-    HBTResults res;
-    res.hOut = hOut; res.hSide = hSide; res.hLong = hLong;
-    res.hRho = hRho; res.total_pairs = pairs_count;
-    return res;
-}
-
-// ===============================
-// Source stats
-// ===============================
 void PrintSourceStats(const SourceStats& stats)
 {
     auto getCount = [&](int pdg) {
@@ -565,16 +664,6 @@ void PrintSourceStats(const SourceStats& stats)
     std::cout << "  halo fraction = "
               << (total > 0 ? double(stats.halo) / total : 0.0) << "\n";
 }
-
-// ===============================
-// Particle/decay tables
-// ===============================
-struct ParticleInfo { std::string name; double mass; double width; std::vector<int> pdgs; };
-struct DecayChannel { double br; int L; std::vector<std::string> daughters; };
-
-std::unordered_map<int, std::vector<DecayChannel>> decayTable;
-std::unordered_map<int, ParticleInfo> particleTable;
-std::unordered_map<std::string, int> nameToPDG;
 
 std::map<int, double> gParentMedianEmission;
 
@@ -638,24 +727,21 @@ void LoadParticleTable(const std::string& filename)
             particleTable[std::abs(pdg)] = info;
             nameToPDG[name] = pdg;
         }
-
-        nameToPDG["π⁺"]  = 211;
-        nameToPDG["eta"] = 221;
-        nameToPDG["π⁻"]  = -211;
-        nameToPDG["π⁰"]  = 111;
-        nameToPDG["γ"]   = 22;
-        nameToPDG["η"]   = 221;
-        nameToPDG["η'"]  = 331;
-        nameToPDG["ω"]   = 223;
-        nameToPDG["ρ⁰"]  = 113;
-        nameToPDG["ρ⁺"]  = 213;
-        nameToPDG["ρ⁻"]  = -213;
-        nameToPDG["K⁺"]  = 321;
-        nameToPDG["K⁻"]  = -321;
-        nameToPDG["K⁰"]  = 311;
-        nameToPDG["K̅⁰"]  = -311;
-        nameToPDG["σ"]   = 9000221;
     }
+
+    // unicode aliases (as read from decaymodes.txt)
+    nameToPDG["eta"]   = 221;   // ASCII, for diagnostics only
+    nameToPDG["eta'"]  = 331;
+    nameToPDG["gamma"] = 22;
+    nameToPDG["pi+"]   = 211;  nameToPDG["pi-"] = -211;  nameToPDG["pi0"] = 111;
+
+    nameToPDG["π⁺"] = 211;  nameToPDG["π⁻"] = -211;  nameToPDG["π⁰"] = 111;
+    nameToPDG["η"]  = 221;  nameToPDG["η'"] = 331;   nameToPDG["η′"] = 331;
+    nameToPDG["γ"]  = 22;   nameToPDG["ω"]  = 223;
+    nameToPDG["ρ⁰"] = 113;  nameToPDG["ρ⁺"] = 213;   nameToPDG["ρ⁻"] = -213;
+    nameToPDG["K⁺"] = 321;  nameToPDG["K⁻"] = -321;
+    nameToPDG["K⁰"] = 311;  nameToPDG["K̅⁰"] = -311;
+    nameToPDG["σ"]  = 9000221;
 
     std::cout << "Loaded " << particleTable.size() << " particle entries\n";
 }
@@ -699,35 +785,18 @@ void LoadDecayModes(const std::string& filename)
     }
 
     std::cout << "Loaded " << decayTable.size() << " decay blocks\n";
-}
 
-// ===============================
-// Lifetime helpers
-// ===============================
-constexpr double hbarc = 0.1973269804; // GeV fm
-TRandom3 rng(0);
-
-double properLifetimeFmC(double widthGeV) {
-    if (widthGeV <= 0.0) return 0.0;
-    return hbarc / widthGeV;
-}
-
-double sampleDecayProperTime(double tau0) {
-    if (!(tau0 > 0.0)) return -1.0;
-    return -tau0 * std::log(rng.Uniform());
-}
-
-double lifetimeFromPDG(int pdg) {
-    pdg = std::abs(pdg);
-    auto it = particleTable.find(pdg);
-    if (it == particleTable.end()) return 0.0;
-    return properLifetimeFmC(it->second.width);
+    for (const auto& [pdg, chans] : decayTable)
+        for (const auto& ch : chans)
+            for (const auto& d : ch.daughters)
+                if (nameToPDG.find(d) == nameToPDG.end())
+                    std::cout << "WARNING: decay daughter name unresolved: " << d << "\n";
 }
 
 // ============================================================
-// Emission-point hierarchy
+// Emission-point assignment
 // ============================================================
-void assignEmissionPoint(Particle& p, int parentPDG, bool halo)
+void assignEmissionPoint(Particle& p, int, bool)
 {
     if (p.hasExplicitEmissionPoint) return;
 
@@ -736,59 +805,60 @@ void assignEmissionPoint(Particle& p, int parentPDG, bool halo)
         p.yf = p.productionY;
         p.zf = p.productionZ;
         p.tf = p.productionT;
+        p.emissionOrigin = p.atEndForcedDecay ? 4 : 1;
         return;
     }
 
-    if (halo) {
-        double tau0 = lifetimeFromPDG(parentPDG);
-        if (tau0 > 0.0) {
-            double tauProper = sampleDecayProperTime(tau0);
-            if (tauProper >= 0.0) {
-                double gamma = p.E / p.mass();
-                double dt    = gamma * tauProper;
-                p.xf = p.x + p.betaX() * dt;
-                p.yf = p.y + p.betaY() * dt;
-                p.zf = p.z + p.betaZ() * dt;
-                p.tf = p.t + dt;
-                return;
-            }
-        }
+    p.xf = p.x; p.yf = p.y; p.zf = p.z; p.tf = p.t;
+
+    const double tEmit = (p.ncoll > 0)
+        ? p.time_last_coll
+        : std::max(p.time_last_coll, p.form_time);
+
+    if (!(tEmit > 0.0) || tEmit > p.t) {
+        p.emissionUnresolved = true;
+        return;
     }
 
-    // Core / direct back-propagation with the ncoll guard.
-    double tEmit = p.time_last_coll;
-    if (p.ncoll == 0 || !(tEmit > 0.0))
-        tEmit = std::max(p.time_last_coll, p.form_time);
-    if (!(tEmit > 0.0)) tEmit = p.t;
-    double dt = p.t - tEmit;
-    if (dt < 0.0) dt = 0.0;
-
+    const double dt = p.t - tEmit;
     p.xf = p.x - p.betaX() * dt;
     p.yf = p.y - p.betaY() * dt;
     p.zf = p.z - p.betaZ() * dt;
-    p.tf = p.t - dt;
+    p.tf = tEmit;
 }
 
 // ===============================
 // Eta decay fallback
+//   -- one channel draw per eta, no redraw;
+//   -- neutral channels are produced too (they contribute zero charged pions,
+//      but keep the particle list self-consistent);
+//   -- the charged flag is reported back to the caller.
 // ===============================
-void DecayEtaParticles(const Particle& eta,
+bool DecayEtaParticles(const Particle& eta,
                        std::vector<Particle>& daughters,
                        int& nextID,
-                       int event_id)
+                       int event_id,
+                       bool& hadChargedOut)
 {
+    hadChargedOut = false;
     auto it = decayTable.find(221);
-    if (it == decayTable.end()) return;
+    if (it == decayTable.end()) return false;
     const auto& channels = it->second;
+    if (channels.empty()) return false;
 
-    double r = gRandom->Rndm();
+    // Normalize by total BR so the rare r > sum case does not discard an eta.
+    double totalBR = 0.0;
+    for (const auto& c : channels) totalBR += c.br;
+    if (!(totalBR > 0.0)) return false;
+
+    double r = gRandom->Rndm() * totalBR;
     double cum = 0.0;
     int chosen = -1;
     for (size_t i = 0; i < channels.size(); ++i) {
         cum += channels[i].br;
         if (r <= cum) { chosen = i; break; }
     }
-    if (chosen < 0) return;
+    if (chosen < 0) chosen = (int)channels.size() - 1;
     const DecayChannel& ch = channels[chosen];
 
     std::vector<double> dmass;
@@ -796,19 +866,18 @@ void DecayEtaParticles(const Particle& eta,
     bool hasChargedPion = false;
     for (const auto& dname : ch.daughters) {
         auto it2 = nameToPDG.find(dname);
-        if (it2 == nameToPDG.end()) return;
+        if (it2 == nameToPDG.end()) return false;
         int pdg = it2->second;
         dPDG.push_back(pdg);
         auto it3 = particleTable.find(std::abs(pdg));
-        if (it3 == particleTable.end()) return;
+        if (it3 == particleTable.end()) return false;
         dmass.push_back(it3->second.mass);
         if (std::abs(pdg) == 211) hasChargedPion = true;
     }
-    if (!hasChargedPion) return;
-    if (dmass.size() < 2 || dmass.size() > 3) return;
+    if (dmass.size() < 2 || dmass.size() > 3) return false;
 
     double tau0 = lifetimeFromPDG(221);
-    if (!(tau0 > 0.0)) return;
+    if (!(tau0 > 0.0)) return false;
 
     double tau   = -tau0 * log(gRandom->Rndm());
     double gamma = eta.E / eta.mass();
@@ -824,6 +893,7 @@ void DecayEtaParticles(const Particle& eta,
 
     if (dmass.size() == 2) {
         double m1 = dmass[0], m2 = dmass[1];
+        if (mEta < m1 + m2) return false;
         double p_cm = sqrt((mEta*mEta - (m1+m2)*(m1+m2)) *
                            (mEta*mEta - (m1-m2)*(m1-m2))) / (2.0 * mEta);
         double cosTheta = 2.0 * gRandom->Rndm() - 1.0;
@@ -837,7 +907,7 @@ void DecayEtaParticles(const Particle& eta,
         p4_rest.push_back(TLorentzVector(-p_cm*sinTheta*cos(phi),
                                          -p_cm*sinTheta*sin(phi),
                                          -p_cm*cosTheta, e2));
-    } else if (dmass.size() == 3) {
+    } else {
         Double_t masses[3] = {dmass[0], dmass[1], dmass[2]};
         TGenPhaseSpace event3;
         TLorentzVector parent4(0, 0, 0, mEta);
@@ -847,7 +917,7 @@ void DecayEtaParticles(const Particle& eta,
         for (int i = 0; i < 3; ++i)
             p4_rest.push_back(*event3.GetDecay(i));
     }
-    if (p4_rest.size() != dmass.size()) return;
+    if (p4_rest.size() != dmass.size()) return false;
 
     TVector3 betaVec(eta.px/eta.E, eta.py/eta.E, eta.pz/eta.E);
     for (size_t i = 0; i < dmass.size(); ++i) p4_rest[i].Boost(betaVec);
@@ -878,14 +948,17 @@ void DecayEtaParticles(const Particle& eta,
         d.proc_type      = eta.proc_type;
         d.proc_id_origin = eta.proc_id_origin;
         d.time_last_coll = eta.time_last_coll;
-        d.form_time      = dvt;      // FIX 2b: fill form_time for injected daughters
+        d.form_time      = dvt;
 
         d.x = dvx; d.y = dvy; d.z = dvz; d.t = dvt;
         d.xf = dvx; d.yf = dvy; d.zf = dvz; d.tf = dvt;
 
         d.hasExplicitEmissionPoint = true;
+        d.emissionOrigin = 2;
         daughters.push_back(d);
     }
+    hadChargedOut = hasChargedPion;
+    return true;
 }
 
 // ============================================================
@@ -936,28 +1009,28 @@ void InitWeakTable()
                                  {0.086,3312,111} } };
 }
 
-void DecayWeakParticle(const Particle& par, std::vector<Particle>& out, int& nextID)
+bool DecayWeakParticle(const Particle& par, std::vector<Particle>& out, int& nextID)
 {
     int  apdg = std::abs(par.pid);
     bool anti = (par.pid < 0);
 
     if (apdg == 311) {
-        if (gRandom->Rndm() > 0.5) return;
+        if (gRandom->Rndm() > 0.5) return false;
         apdg = 310; anti = false;
     }
     auto it = gWeak.find(apdg);
-    if (it == gWeak.end()) return;
+    if (it == gWeak.end()) return false;
     const WeakSpecies& sp = it->second;
 
     double r = gRandom->Rndm(), cum = 0.0;
     const WeakChannel* ch = nullptr;
     for (const auto& c : sp.ch) { cum += c.br; if (r <= cum) { ch = &c; break; } }
-    if (!ch) return;
+    if (!ch) return false;
 
     const int    d1 = Conj(ch->a, anti), d2 = Conj(ch->b, anti);
     const double m1 = WeakMass(std::abs(d1)), m2 = WeakMass(std::abs(d2));
     const double M  = WeakMass(apdg);
-    if (m1 < 0.0 || m2 < 0.0 || M < m1 + m2) return;
+    if (m1 < 0.0 || m2 < 0.0 || M < m1 + m2) return false;
 
     double u = gRandom->Rndm(); if (u <= 0.0) u = 1e-12;
     const double tau   = -sp.ctau_fm * std::log(u);
@@ -992,14 +1065,16 @@ void DecayWeakParticle(const Particle& par, std::vector<Particle>& out, int& nex
         d.proc_type      = par.proc_type;
         d.proc_id_origin = par.proc_id_origin;
         d.time_last_coll = par.time_last_coll;
-        d.form_time      = dvt;   // FIX 2b: fill form_time for injected daughters
+        d.form_time      = dvt;
         d.x = dvx; d.y = dvy; d.z = dvz; d.t = dvt;
         d.xf = dvx; d.yf = dvy; d.zf = dvz; d.tf = dvt;
         d.hasExplicitEmissionPoint = true;
+        d.emissionOrigin = 3;
         out.push_back(d);
     };
     emit(d1, q1);
     emit(d2, q2);
+    return true;
 }
 
 void DecayWeakSpecies(std::vector<Particle>& particles, int& nextID)
@@ -1010,8 +1085,9 @@ void DecayWeakSpecies(std::vector<Particle>& particles, int& nextID)
         const size_t end = particles.size();
         std::vector<Particle> newD;
         for (size_t i = begin; i < end; ++i)
-            if (IsWeakParent(particles[i].pid))
-                DecayWeakParticle(particles[i], newD, nextID);
+            if (IsWeakParent(particles[i].pid) && !particles[i].decayedByUs)
+                if (DecayWeakParticle(particles[i], newD, nextID))
+                    particles[i].decayedByUs = true;
         if (newD.empty()) break;
         for (const auto& d : newD) if (std::abs(d.pid) == 211) nPions++;
         begin = end;
@@ -1043,7 +1119,7 @@ void ComputeProjectionDiagnostics(
     const HBTResults& res,
     double fit_min,
     const double fit_max_x[3],
-    double rho_lambda_max,
+    double /*rho_lambda_max*/,
     const double* p,
     double devProj[3],
     double obsProj[3],
@@ -1053,11 +1129,7 @@ void ComputeProjectionDiagnostics(
     TH1F* hists[3] = {res.hOut, res.hSide, res.hLong};
 
     for (int i = 0; i < 3; ++i) {
-        int lastLambdaBin = hists[i]->FindBin(rho_lambda_max);
-        if (lastLambdaBin > hists[i]->GetNbinsX())
-            lastLambdaBin = hists[i]->GetNbinsX();
-
-        const double normalizationCount = hists[i]->Integral(0, lastLambdaBin);
+        const double normalizationCount = static_cast<double>(res.total_pairs);
         if (!(normalizationCount > 0.0)) continue;
 
         const int firstFitBin = hists[i]->FindBin(fit_min);
@@ -1085,8 +1157,8 @@ void ComputeProjectionDiagnostics(
 FitResult RunLevyFit(HBTResults& res,
                      double fit_min,
                      double fit_max,
-                     double mT,
-                     double rhoLamMax,
+                     double /*mT*/,
+                     double /*rhoLamMax*/,
                      const double* warmPar = nullptr,
                      int    nStarts        = 5)
 {
@@ -1107,12 +1179,11 @@ FitResult RunLevyFit(HBTResults& res,
         HBTResults res;
         double fit_min;
         double fit_max_x[3];
-        double rho_lambda_max;
         int*   pBinsUsed;
 
         LogLikelihood(const HBTResults& r, double min,
-                      const double mv[3], double rhoLamMax, int* bp)
-            : res(r), fit_min(min), rho_lambda_max(rhoLamMax), pBinsUsed(bp)
+                      const double mv[3], int* bp)
+            : res(r), fit_min(min), pBinsUsed(bp)
         {
             for (int i = 0; i < 3; ++i) fit_max_x[i] = mv[i];
         }
@@ -1123,11 +1194,7 @@ FitResult RunLevyFit(HBTResults& res,
             TH1F* hists[3] = {res.hOut, res.hSide, res.hLong};
 
             for (int i = 0; i < 3; ++i) {
-                int lastLambdaBin = hists[i]->FindBin(rho_lambda_max);
-                if (lastLambdaBin > hists[i]->GetNbinsX())
-                    lastLambdaBin = hists[i]->GetNbinsX();
-
-                const double normalizationCount = hists[i]->Integral(0, lastLambdaBin);
+                const double normalizationCount = static_cast<double>(res.total_pairs);
                 if (!(normalizationCount > 0.0)) return 1.0e100;
 
                 const int firstFitBin = hists[i]->FindBin(fit_min);
@@ -1162,7 +1229,7 @@ FitResult RunLevyFit(HBTResults& res,
         CountFitBins(res.hSide, fit_min, fit_max) +
         CountFitBins(res.hLong, fit_min, fit_max);
 
-    LogLikelihood loglikfunc(res, fit_min, fit_max_x, rhoLamMax, &actualBins);
+    LogLikelihood loglikfunc(res, fit_min, fit_max_x, &actualBins);
     ROOT::Math::Functor f(loglikfunc, NPAR);
 
     bool   have    = false;
@@ -1260,29 +1327,33 @@ FitResult RunLevyFit(HBTResults& res,
     fr.boundaryReject = finiteFinal && atBoundaryFinal;
     fr.ok = have && finiteFinal && !atBoundaryFinal && fr.ndf > 0;
 
-    ComputeProjectionDiagnostics(res, fit_min, fit_max_x, rhoLamMax,
+    ComputeProjectionDiagnostics(res, fit_min, fit_max_x, 0.0,
                                  bestX, fr.devProj, fr.obsProj, fr.expProj);
     return fr;
 }
 
 // ============================================================
-// Bootstrap (with pair cache)
+// Pair cache
 // ============================================================
-struct PairTriplet { double r_out, r_side, r_long; };
+struct PairTriplet { double r_out, r_side, r_long; float mT; bool endF; };
 
-// ------------------------------------------------------------
-// Build the per-event, per-kT-bin pair cache.
-// ------------------------------------------------------------
 std::vector<std::map<int, std::vector<PairTriplet>>>
 BuildPairCache(const std::vector<Particle>& particles,
-               const std::vector<double>& kT_bins)
+               const std::vector<double>& kT_bins,
+               std::vector<long>& nSel,
+               std::vector<long>& nEnd)
 {
     const int nBins = (int)kT_bins.size() - 1;
     std::vector<std::map<int, std::vector<PairTriplet>>> cache(nBins);
+    nSel.assign(nBins, 0);
+    nEnd.assign(nBins, 0);
+
+    long nUnresolvedPions = 0;
 
     std::map<int, std::vector<const Particle*>> events;
     for (const auto& p : particles) {
         if (std::abs(p.pid) != 211) continue;
+        if (p.emissionUnresolved) { ++nUnresolvedPions; continue; }
         events[p.event_id].push_back(&p);
     }
 
@@ -1340,24 +1411,56 @@ BuildPairCache(const std::vector<Particle>& particles,
                     if (!std::isfinite(r_out) || !std::isfinite(r_side) ||
                         !std::isfinite(r_long)) continue;
 
-                    slot.push_back({r_out, r_side, r_long});
+                    const bool endF = p1.atEndForcedDecay || p2.atEndForcedDecay;
+                    ++nSel[ibin];
+                    if (endF) ++nEnd[ibin];
+                    slot.push_back({r_out, r_side, r_long, (float)mT, endF});
                 }
             }
         }
     }
+    std::cout << "Pair cache: excluded " << nUnresolvedPions
+              << " unresolved pions from pair construction\n";
     return cache;
 }
 
-// ------------------------------------------------------------
-// Fill histograms from the cache for a chosen set of events.
-// ------------------------------------------------------------
-HBTResults FillFromCache(
-    const std::map<int, std::vector<PairTriplet>>& cacheForBin,
-    const std::vector<int>& chosenEvents)
+struct MTStats { long n = 0; double meanMT = 0, rmsMT = 0, meanKT = 0; TH1D* h = nullptr; };
+
+std::vector<MTStats> ComputeMTStats(
+    const std::vector<std::map<int, std::vector<PairTriplet>>>& cache,
+    const std::vector<double>& kT_bins)
+{
+    const double mpi = 0.13957;
+    std::vector<MTStats> out(cache.size());
+    for (size_t ib = 0; ib < cache.size(); ++ib) {
+        MTStats& s = out[ib];
+        s.h = new TH1D(Form("hMT_%d", (int)ib),
+                       Form("m_{T} of pairs, k_{T} %.3f-%.3f;m_{T} [GeV];pairs",
+                            kT_bins[ib], kT_bins[ib+1]), 200, 0.13, 1.2);
+        double sum = 0, sum2 = 0, sumK = 0;
+        for (auto& ev : cache[ib])
+            for (auto& t : ev.second) {
+                const double m = t.mT;
+                sum += m; sum2 += m*m;
+                sumK += std::sqrt(std::max(0.0, m*m - mpi*mpi));
+                s.h->Fill(m); ++s.n;
+            }
+        if (s.n > 0) {
+            s.meanMT = sum / s.n;
+            s.rmsMT  = std::sqrt(std::max(0.0, sum2 / s.n - s.meanMT * s.meanMT));
+            s.meanKT = sumK / s.n;
+        }
+    }
+    return out;
+}
+
+HBTResults FillFromCache(const std::map<int, std::vector<PairTriplet>>& cacheForBin,
+                         const std::vector<int>& chosenEvents,
+                         double rhoCut,
+                         bool excludeEndForced = false)
 {
     const int n_bins = 300;
-    const double rho_min = 0.1;
-    const double rho_max = 1.0e15;
+    const double rho_min = 0.1, rho_max = 1.0e15;
     double bins[n_bins + 1];
     const double logStep = std::pow(rho_max / rho_min, 1.0 / n_bins);
     bins[0] = rho_min;
@@ -1374,9 +1477,11 @@ HBTResults FillFromCache(
         auto it = cacheForBin.find(evid);
         if (it == cacheForBin.end()) continue;
         for (const auto& t : it->second) {
-            double rho = std::sqrt(t.r_out*t.r_out
-                                 + t.r_side*t.r_side
-                                 + t.r_long*t.r_long);
+            if (excludeEndForced && t.endF) continue;
+            const double rho = std::sqrt(t.r_out*t.r_out
+                                       + t.r_side*t.r_side
+                                       + t.r_long*t.r_long);
+            if (!(rho < rhoCut)) continue;
             hRho->Fill(rho);
             hOut->Fill(std::fabs(t.r_out));
             hSide->Fill(std::fabs(t.r_side));
@@ -1384,11 +1489,16 @@ HBTResults FillFromCache(
             ++pairs_count;
         }
     }
-
     HBTResults res;
     res.hOut = hOut; res.hSide = hSide; res.hLong = hLong;
     res.hRho = hRho; res.total_pairs = pairs_count;
     return res;
+}
+
+static void FreeHBT(HBTResults& r)
+{
+    delete r.hOut; delete r.hSide; delete r.hLong; delete r.hRho;
+    r.hOut = r.hSide = r.hLong = r.hRho = nullptr;
 }
 
 struct BootstrapResult {
@@ -1406,7 +1516,7 @@ BootstrapResult RunEventBootstrap(
     double D_nominal,
     const double* nominalPar,
     int binIndex,
-    int B = 100)
+    int B = 50)
 {
     BootstrapResult br;
     double warmPar[5] = {0,0,0,0,0};
@@ -1425,17 +1535,15 @@ BootstrapResult RunEventBootstrap(
         for (int k = 0; k < N; ++k)
             chosen.push_back(all_event_ids[boot_rng.Integer(N)]);
 
-        HBTResults res_b = FillFromCache(cacheForBin, chosen);
+        HBTResults res_b = FillFromCache(cacheForBin, chosen, rhoLamMax);
         if (res_b.total_pairs < 100) {
-            delete res_b.hOut;  delete res_b.hSide;
-            delete res_b.hLong; delete res_b.hRho;
+            FreeHBT(res_b);
             continue;
         }
 
         FitResult fr = RunLevyFit(res_b, fit_min, fit_max, mT, rhoLamMax,
                                   warmPar, /*nStarts=*/2);
-        delete res_b.hOut;  delete res_b.hSide;
-        delete res_b.hLong; delete res_b.hRho;
+        FreeHBT(res_b);
         if (!fr.ok) continue;
 
         br.alpha.push_back(fr.alpha);
@@ -1508,6 +1616,118 @@ static void PrintNCollDiagnostic(const std::vector<Particle>& particles)
               << "  (of which form_time <= 0: " << nNCbad << ")\n";
 }
 
+void DrawEmissionTimeCheck(const std::vector<Particle>& particles,
+                           double tEnd = 300.0)
+{
+    const char* names[5] = {"core", "history",
+                            "eta fallback", "weak forced", "end-forced"};
+    const int    cols[5] = {kGray, kBlue, kRed, kGreen+2, kMagenta};
+
+    const int    nBinsPerDec = 60;
+    const double tLo = 0.1;
+    const double tHi = 1.0e15;
+    const int    nDec = (int)std::round(std::log10(tHi / tLo));
+    const int    nBins = nDec * nBinsPerDec;
+
+    double edges[nBins + 1];
+    const double logStep = std::log10(tHi / tLo) / nBins;
+    edges[0] = tLo;
+    for (int i = 1; i <= nBins; ++i)
+        edges[i] = tLo * std::pow(10.0, i * logStep);
+
+    TH1D* h[5];
+    for (int i = 0; i < 5; ++i) {
+        h[i] = new TH1D(Form("hT%d", i),
+                        Form("%s;t_{f} [fm/c];pions per log bin", names[i]),
+                        nBins, edges);
+        h[i]->SetDirectory(0);
+    }
+
+    long nAtEnd[5] = {0,0,0,0,0}, nTot[5] = {0,0,0,0,0};
+    long nOverflow[5] = {0,0,0,0,0}, nNeg[5] = {0,0,0,0,0};
+    double minT[5] = {1e300,1e300,1e300,1e300,1e300};
+    double maxT[5] = {-1e300,-1e300,-1e300,-1e300,-1e300};
+
+    for (const auto& p : particles) {
+        if (std::abs(p.pid) != 211) continue;
+        const int o = p.emissionOrigin;
+        if (o < 0 || o > 4) continue;
+
+        if (p.tf < 0.0) { ++nNeg[o]; continue; }
+        if (p.tf > tHi) { ++nOverflow[o]; }
+        h[o]->Fill(p.tf);
+        ++nTot[o];
+        if (p.tf < minT[o]) minT[o] = p.tf;
+        if (p.tf > maxT[o]) maxT[o] = p.tf;
+
+        if (std::fabs(p.tf - tEnd) < 1.0e-3) ++nAtEnd[o];
+    }
+
+    // ---- find global maximum so no curve is clipped ----
+    double globalMax = 1.0;
+    for (int i = 0; i < 5; ++i)
+        for (int b = 1; b <= h[i]->GetNbinsX(); ++b) {
+            const double y = h[i]->GetBinContent(b);
+            if (y > globalMax) globalMax = y;
+        }
+    const double yMax = std::pow(10.0, std::ceil(std::log10(globalMax))) * 3.0;
+
+    // ---- Console diagnostic ----
+    std::cout << "\n=== Forced-decay emission-time diagnostic ===\n";
+    std::cout << "t_end = " << tEnd << " fm/c\n";
+    for (int i = 0; i < 5; ++i) {
+        if (nTot[i] == 0) {
+            std::cout << "  origin " << i << " (" << names[i] << "): no pions\n";
+            continue;
+        }
+        std::cout << "  origin " << i << " (" << names[i] << "):"
+                  << " N=" << nTot[i]
+                  << "  t_f range = [" << minT[i] << ", " << maxT[i] << "] fm/c"
+                  << "  n(t_f ~ t_end) = " << nAtEnd[i]
+                  << " (" << (100.0 * nAtEnd[i] / nTot[i]) << "%)"
+                  << "  overflow (t_f > " << tHi << ") = " << nOverflow[i];
+        if (nNeg[i] > 0) std::cout << "  NEGATIVE t_f = " << nNeg[i];
+        std::cout << "\n";
+    }
+
+    // ---- Canvas ----
+    TCanvas* c = new TCanvas("cEmisT", "emission times by origin", 1100, 700);
+    c->cd(1);
+    gPad->SetLogx();
+    gPad->SetLogy();
+
+    TLegend* leg = new TLegend(0.55, 0.65, 0.92, 0.90);
+    leg->SetBorderSize(0); leg->SetFillStyle(0);
+
+    bool first = true;
+    for (int i = 0; i < 5; ++i) {
+        if (nTot[i] == 0) continue;
+        h[i]->SetLineColor(cols[i]);
+        h[i]->SetLineWidth(2);
+        h[i]->GetXaxis()->SetTitle("t_{f} [fm/c]");
+        h[i]->GetYaxis()->SetTitle("Pions Multiplicity");
+        if (first) {
+            h[i]->SetMinimum(1.0);
+            h[i]->SetMaximum(yMax);
+        }
+        h[i]->Draw(first ? "HIST" : "HIST SAME");
+        first = false;
+        leg->AddEntry(h[i],
+                      Form("%s  N=%ld ", names[i], nTot[i]),
+                      "L");
+    }
+    leg->Draw();
+
+    for (double x = 1.0; x <= tHi; x *= 10.0) {
+        TLine* l = new TLine(x, 0.5, x, 1e10);
+        l->SetLineStyle(3);
+        l->SetLineColor(kGray+2);
+        l->Draw();
+    }
+
+    c->SaveAs("emission_time_by_origin.png");
+}
+
 // ============================================================
 // Main
 // ============================================================
@@ -1516,6 +1736,7 @@ void auau3D()
     gStyle->SetOptStat(0);
     gStyle->SetOptTitle(0);
     TH1::AddDirectory(kFALSE);
+    gRandom->SetSeed(12345);
 
     const char* oscar_file = "/home/zeinab/Documents/vhlle-smash/hybrid/AuAu_RHIC200/backup800200smashrunsoscars/200fullinfo/particle_listspar_1000events.oscar";
 
@@ -1540,7 +1761,6 @@ void auau3D()
 
     vector<Particle> particles = LoadOSCAR(oscar_file);
 
-    // FIX 4: ncoll diagnostic moved before any forced decays.
     PrintNCollDiagnostic(particles);
 
     int nextID = particles.size() + 100000;
@@ -1551,46 +1771,117 @@ void auau3D()
     }
     MatchHistoryVertices(particles, productionMap);
 
-    // ---- Eta fallback ----
-    std::set<std::pair<int,int>> etaMatched;
-    for (const auto& p : particles) {
-        if (std::abs(p.pid) == 211 && p.hasHistoryProductionVertex &&
-            std::abs(p.historyParentPDG) == 221) {
-            etaMatched.insert({p.event_id, p.historyParentID});
+    // ---- Pion-specific history census ----
+    PrintHistoryCensus(particles);
+
+    // ---- Split the drop reason, then perform the drop ----
+    {
+        std::map<int, std::pair<long,long>> cnt;   // [pions, matched]
+        for (const auto& p : particles) {
+            if (std::abs(p.pid) != 211) continue;
+            auto& c = cnt[p.event_id];
+            ++c.first;
+            if (p.hasHistoryProductionVertex) ++c.second;
         }
+        std::set<int> zeroMatchInHist, absentFromHist, badEvents;
+        for (auto& kv : cnt) {
+            if (kv.second.first == 0) continue;
+            if (kv.second.second > 0) continue;
+            if (gHistEventIds.count(kv.first)) zeroMatchInHist.insert(kv.first);
+            else                               absentFromHist.insert(kv.first);
+            badEvents.insert(kv.first);
+        }
+        std::cout << "Zero-match events: " << zeroMatchInHist.size()
+                  << " present in the history file (matching failure), "
+                  << absentFromHist.size() << " absent from the history file\n";
+
+        {
+            std::ofstream f("events_without_history.txt");
+            for (int e : badEvents) f << e << "\n";
+        }
+
+        if (!badEvents.empty()) {
+            const size_t before = particles.size();
+            particles.erase(std::remove_if(particles.begin(), particles.end(),
+                [&](const Particle& p){ return badEvents.count(p.event_id) > 0; }), particles.end());
+            std::cout << "Dropped " << badEvents.size()
+                      << " events without history ("
+                      << before - particles.size() << " particles)\n";
+            PrintHistoryCensus(particles);
+        }
+
+        // Census file(s) for the referee reply.
+        WriteEventCensus(particles, "event_census_after_drop.txt");
     }
 
-    std::vector<Particle> eta_daughters;
-    int etasSkipped = 0, etasDecayed = 0;
-    for (const auto& p : particles) {
-        if (std::abs(p.pid) == 221) {
-            if (etaMatched.count({p.event_id, p.ID})) {
-                etasSkipped++;
+    // ---- Eta fallback with full accounting ----
+    {
+        std::set<std::pair<int,int>> etaMatched;   // pions from eta parents seen in the history
+        for (const auto& p : particles) {
+            if (std::abs(p.pid) == 211 && p.hasHistoryProductionVertex &&
+                std::abs(p.historyParentPDG) == 221) {
+                etaMatched.insert({p.event_id, p.historyParentID});
+            }
+        }
+
+        std::vector<Particle> eta_daughters;
+        long etasTotal = 0;
+        int etasHistCharged = 0, etasHistNeutral = 0;
+        int etasFallCharged = 0, etasFallNeutral = 0;
+        int etasSkippedByDaughterMatch = 0;
+
+        for (size_t i = 0; i < particles.size(); ++i) {
+            auto& p = particles[i];
+            if (std::abs(p.pid) != 221) continue;
+            ++etasTotal;
+
+            // parent-side test from the history parser
+            auto it = gParentDecay.find({p.event_id, p.ensemble_id, p.ID});
+            if (it != gParentDecay.end()) {
+                if (it->second.hasChargedPion) ++etasHistCharged;
+                else                           ++etasHistNeutral;
+                p.decayedByUs = true;         // never re-decay a history-decayed eta
                 continue;
             }
-            DecayEtaParticles(p, eta_daughters, nextID, p.event_id);
-            etasDecayed++;
+
+            // legacy daughter-based guard (expected to be ~0)
+            if (etaMatched.count({p.event_id, p.ID})) {
+                ++etasSkippedByDaughterMatch;
+                p.decayedByUs = true;
+                continue;
+            }
+
+            bool charged = false;
+            if (DecayEtaParticles(p, eta_daughters, nextID, p.event_id, charged)) {
+                p.decayedByUs = true;
+                if (charged) ++etasFallCharged; else ++etasFallNeutral;
+            }
         }
+
+        std::cout << "Eta accounting: total " << etasTotal
+                  << " | history-decayed " << etasHistCharged << " charged / "
+                  << etasHistNeutral << " neutral"
+                  << " | fallback " << etasFallCharged << " charged / "
+                  << etasFallNeutral << " neutral"
+                  << " | daughter-match-skip " << etasSkippedByDaughterMatch
+                  << "\n";
+
+        particles.insert(particles.end(), eta_daughters.begin(), eta_daughters.end());
+
+        int etaPions = 0;
+        for (const auto& d : eta_daughters)
+            if (std::abs(d.pid) == 211) etaPions++;
+        std::cout << "Generated " << etaPions << " charged pions from eta decays\n";
     }
-
-    std::cout << "Eta preprocessing: " << etasSkipped << " etas already covered by history, "
-              << etasDecayed << " decayed via fallback sampling\n";
-    std::cout << "Created " << eta_daughters.size() << " eta daughter particles\n";
-
-    particles.insert(particles.end(), eta_daughters.begin(), eta_daughters.end());
-
-    int etaPions = 0;
-    for (const auto& d : eta_daughters)
-        if (std::abs(d.pid) == 211) etaPions++;
-    std::cout << "Generated " << etaPions << " charged pions from eta decays\n";
 
     // ---- Weak decays ----
     InitWeakTable();
     DecayWeakSpecies(particles, nextID);
 
-    // ---- Unstable-particle census ----
+    // ---- Unstable-particle census (skip decayedByUs) ----
     std::map<int,int> unstableLeft;
     for (const auto& p : particles) {
+        if (p.decayedByUs) continue;
         auto it = particleTable.find(std::abs(p.pid));
         if (it == particleTable.end()) continue;
         const double width = it->second.width;
@@ -1609,6 +1900,8 @@ void auau3D()
         bool isHalo    = (parentPDG != 0) && isHaloParent(parentPDG);
         assignEmissionPoint(p, parentPDG, isHalo);
     }
+
+    DrawEmissionTimeCheck(particles, 300.0);
 
     std::cout << "\n=== Simulated parent emission radii ===\n";
     ComputeParentMedianEmission(particles);
@@ -1639,18 +1932,42 @@ void auau3D()
     myLevy_reader = new Levy_reader("levy_proj3D_values.dat");
 
     vector<double> kT_bins;
-    double kT_min_val = 0.15;
-    double kT_max_val = 0.75;
+    double kT_min_val = 0.175;
+    double kT_max_val = 0.725;
     double step = 0.05;
     for (double k = kT_min_val; k <= kT_max_val + 1e-6; k += step) {
         kT_bins.push_back(k);
     }
     int nBins = kT_bins.size() - 1;
 
-    // FIX 6: build the pair cache once, before the kT loop.
     std::cout << "\nBuilding pair cache...\n";
-    auto pairCache = BuildPairCache(particles, kT_bins);
+    std::vector<long> nSelPairs, nEndPairs;
+    auto pairCache = BuildPairCache(particles, kT_bins, nSelPairs, nEndPairs);
     std::cout << "Pair cache ready.\n";
+
+    for (int ib = 0; ib < nBins; ++ib) {
+        const double frac = (nSelPairs[ib] > 0)
+                          ? double(nEndPairs[ib]) / double(nSelPairs[ib]) : 0.0;
+        std::cout << "  kT " << kT_bins[ib] << "-" << kT_bins[ib+1]
+                  << ": pairs " << nSelPairs[ib]
+                  << ", with end-forced pion " << nEndPairs[ib]
+                  << " (" << (100.0*frac) << "%)\n";
+    }
+
+    auto mtStats = ComputeMTStats(pairCache, kT_bins);
+    {
+        TFile fmt("mT_distributions.root", "RECREATE");
+        for (int ib = 0; ib < nBins; ++ib) {
+            const double kc = 0.5 * (kT_bins[ib] + kT_bins[ib+1]);
+            const double mc = std::sqrt(kc*kc + 0.13957*0.13957);
+            std::cout << "kT " << kT_bins[ib] << "-" << kT_bins[ib+1]
+                      << "  N=" << mtStats[ib].n << "  <mT>=" << mtStats[ib].meanMT
+                      << "  RMS=" << mtStats[ib].rmsMT << "  mT(centre)=" << mc
+                      << "  diff=" << mtStats[ib].meanMT - mc << "\n";
+            mtStats[ib].h->Write();
+        }
+        fmt.Close();
+    }
 
     vector<pair<string, double>> rhoLambdaCutoffs = {
         {"1mm",   1.0e12},
@@ -1667,7 +1984,7 @@ void auau3D()
     vector<double> chi2_vals, ndf_vals, CL_vals;
     vector<int> success_vals;
 
-    const int nBootstrap = 50;   // FIX 5: production value
+    const int nBootstrap = 20;
 
     vector<double> kTlo_vals, kThi_vals;
     vector<double> alpha_bootErr, Rout_bootErr, Rside_bootErr, Rlong_bootErr, lambda_bootErr;
@@ -1682,30 +1999,29 @@ void auau3D()
 
     // ---- kT loop ----
     for (int ibin = 0; ibin < nBins; ibin++) {
-        double kT_min = kT_bins[ibin];
-        double kT_max = kT_bins[ibin+1];
+        const double kT_min = kT_bins[ibin], kT_max = kT_bins[ibin+1];
         cout << "\n=== kT bin: " << kT_min << " - " << kT_max << " ===" << endl;
-
-        HBTResults res = AnalyzePairs(particles, kT_min, kT_max, false);
-        // FIX 1: raise threshold from 10 to 100.
-        if (res.total_pairs < 100) continue;
+        if (mtStats[ibin].n < 100) continue;
 
         const double fit_min = 0.1;
-        double kT_mean = 0.5 * (kT_min + kT_max);
-        const double m_pi = 0.13957;
-        double mT = sqrt(kT_mean*kT_mean + m_pi*m_pi);
-        double fit_max = sqrt(2500.0/mT);
+        const double mT      = mtStats[ibin].meanMT;
+        const double fit_max = std::sqrt(2500.0 / mT);
+        const double NaN     = std::numeric_limits<double>::quiet_NaN();
 
         bool shapeStored = false;
-        const double NaN = std::numeric_limits<double>::quiet_NaN();
+        HBTResults res1mm = {nullptr, nullptr, nullptr, nullptr, 0};
 
         for (auto& lc : rhoLambdaCutoffs) {
             const string& label = lc.first;
             const double rhoLamMax = lc.second;
 
-            FitResult fit = RunLevyFit(res, fit_min, fit_max, mT, rhoLamMax);
+            HBTResults resC = FillFromCache(pairCache[ibin], all_event_ids, rhoLamMax);
+            FitResult fit{};
+            if (resC.total_pairs >= 100)
+                fit = RunLevyFit(resC, fit_min, fit_max, mT, rhoLamMax);
 
             if (!fit.ok) {
+                FreeHBT(resC);
                 cout << "  " << label << ": fit rejected (status "
                      << fit.status << ")\n";
                 if (fit.boundaryReject) {
@@ -1720,6 +2036,9 @@ void auau3D()
                 lambda_err_by_cutoff[label].push_back(NaN);
                 continue;
             }
+
+            if (label == "1mm") res1mm = resC;
+            else                FreeHBT(resC);
 
             const double CL = (fit.ndf > 0) ? TMath::Prob(fit.deviance, fit.ndf) : 0.0;
 
@@ -1749,6 +2068,19 @@ void auau3D()
                 for (int d = 0; d < 3; ++d)
                     cout << "    " << dirs[d] << ": D = " << fit.devProj[d]
                          << ", obs = " << fit.obsProj[d] << ", exp = " << fit.expProj[d] << "\n";
+
+                HBTResults resNoEnd = FillFromCache(pairCache[ibin], all_event_ids,
+                                                    rhoLamMax, /*excludeEndForced=*/true);
+                FitResult fitNoEnd{};
+                if (resNoEnd.total_pairs >= 100)
+                    fitNoEnd = RunLevyFit(resNoEnd, fit_min, fit_max, mT, rhoLamMax);
+                if (fitNoEnd.ok) {
+                    cout << "  [no-endpoint sensitivity] lambda " << fitNoEnd.lambda
+                         << " (nominal " << fit.lambda << "), Rout "
+                         << fitNoEnd.Rout << " (" << fit.Rout << "), alpha "
+                         << fitNoEnd.alpha << " (" << fit.alpha << ")\n";
+                }
+                FreeHBT(resNoEnd);
 
                 const double nomPar[5] = {fit.alpha, fit.Rout, fit.Rside,
                                           fit.Rlong, fit.lambda};
@@ -1782,12 +2114,12 @@ void auau3D()
             double Rlong = Rlong_vals[idx];
             double lam   = lambda_by_cutoff["1mm"].back();
 
-            auto drawCanvas = [&](double xDisplayMin, double xDisplayMax,
-                                  bool showTail, const char* fileSuffix) {
+            auto drawCanvas = [&](const HBTResults& res_plot, double normPairs, double xDisplayMin,
+                      double xDisplayMax, bool showTail, const char* fileSuffix) {
 
                 TCanvas* c = new TCanvas(Form("c_%d_%s", ibin, fileSuffix),
                                          Form("kT: %.2f-%.2f GeV/c, N_{pairs} = %d",
-                                              kT_min, kT_max, res.total_pairs),
+                                              kT_min, kT_max, res_plot.total_pairs),
                                          2500, 850);
 
                 double padWidth = 1.0/3.0;
@@ -1797,7 +2129,7 @@ void auau3D()
                 pad1->Draw(); pad2->Draw(); pad3->Draw();
                 TPad* pads[3] = {pad1, pad2, pad3};
 
-                TH1F* hdir[3] = {res.hOut, res.hSide, res.hLong};
+                TH1F* hdir[3] = {res_plot.hOut, res_plot.hSide, res_plot.hLong};
                 const char* names[3] = {"out", "side", "long"};
 
                 for (int idir = 0; idir < 3; ++idir) {
@@ -1822,15 +2154,9 @@ void auau3D()
                         Form("h_%s_%s_%d", names[idir], fileSuffix, ibin));
                     h->SetDirectory(0);
 
-                    const double rho_lambda_max = 1.0e12;
-                    int lastNormBin = h->FindBin(rho_lambda_max);
-                    if (lastNormBin > h->GetNbinsX())
-                        lastNormBin = h->GetNbinsX();
-
-                    const double norm = h->Integral(0, lastNormBin);
+                    const double norm = normPairs;
                     if (norm > 0.0) h->Scale(1.0 / norm, "width");
 
-                    const double rho_min = 0.1;
                     const double lambda1mmCutoff = 1.0e12;
 
                     h->GetXaxis()->SetRangeUser(xDisplayMin, xDisplayMax);
@@ -1865,6 +2191,13 @@ void auau3D()
 
                     gPad->SetTickx(0);
                     gPad->SetTicky(0);
+
+                    // suppress zero-content markers in the show-tail view
+                    if (showTail) {
+                        for (int b = 1; b <= h->GetNbinsX(); ++b)
+                            if (h->GetBinContent(b) <= 0.0)
+                                h->SetBinContent(b, 1e-25);
+                    }
 
                     h->Draw("E");
                     gPad->Update();
@@ -1938,7 +2271,7 @@ void auau3D()
                         latexLambda.SetNDC();
                         latexLambda.SetTextSize(0.05);
                         latexLambda.SetTextAlign(32);
-                        latexLambda.DrawLatex(xNdcLambda - 0.012, 0.85, "#rho_{max}^{#lambda}");
+                        latexLambda.DrawLatex(xNdcLambda - 0.012, 0.75, "#rho_{max}^{#lambda}");
                     } else if (idir == 1 && !showTail) {
                         gPad->Update();
                         double xNdcFit = (log10(fit_max) - log10(xDisplayMin)) / (log10(xDisplayMax) - log10(xDisplayMin));
@@ -1969,13 +2302,19 @@ void auau3D()
                 yTitle.SetTextFont(42);
                 yTitle.DrawLatex(0.06, 0.94, "D(#rho)");
 
-                c->SaveAs(Form("kT_%.2f-%.2f_%s.png", kT_min, kT_max, fileSuffix));
+                const TString stem = Form("kT_%.2f-%.2f_%s",
+                                          kT_min, kT_max, fileSuffix);
+                c->SaveAs(stem + ".png");
+                c->SaveAs(stem + ".pdf");
                 delete c;
             };
 
-            drawCanvas(0.1, 1.0e15,  true,  "allRange");
-            drawCanvas(0.1, fit_max, false, "coreFit");
+            HBTResults res_full = FillFromCache(pairCache[ibin], all_event_ids, 1.0e15);
+            drawCanvas(res_full, res1mm.total_pairs, 0.1, 1.0e15,  true,  "allRange");
+            drawCanvas(res1mm,   res1mm.total_pairs, 0.1, fit_max, false, "coreFit");
+            FreeHBT(res_full);
         }
+        FreeHBT(res1mm);
     }
 
     // ============================================================
@@ -2012,65 +2351,69 @@ void auau3D()
 
     // ---- Pad 1: alpha ----
     c_mT->cd(1);
-    TGraphErrors *gAlpha = new TGraphErrors(nPoints,
-        &mt_vals[0], &alpha_vals[0],
-        &mt_err[0],  &alpha_bootErr[0]);
-    gAlpha->SetTitle("#alpha vs m_{T}; m_{T} [GeV/c^{2}]; #alpha");
-    gAlpha->SetMarkerStyle(23);
-    gAlpha->SetMarkerSize(1.4);
-    gAlpha->SetMarkerColor(kBlack);
-    SetDataDrivenYRange(gAlpha, alpha_vals, 0.10);
-    gAlpha->Draw("APE");
-    gPad->Update();
-    gAlpha->GetXaxis()->SetLabelSize(0.075);
-    gAlpha->GetYaxis()->SetLabelSize(0.075);
-    gAlpha->GetXaxis()->SetTitleSize(0.080);
-    gAlpha->GetYaxis()->SetTitleSize(0.080);
-    gAlpha->GetXaxis()->SetTitleOffset(0.95);
-    gAlpha->GetYaxis()->SetTitleOffset(0.90);
+    if (nPoints > 0) {
+        TGraphErrors *gAlpha = new TGraphErrors(nPoints,
+            &mt_vals[0], &alpha_vals[0],
+            &mt_err[0],  &alpha_bootErr[0]);
+        gAlpha->SetTitle("#alpha vs m_{T}; m_{T} [GeV/c^{2}]; #alpha");
+        gAlpha->SetMarkerStyle(23);
+        gAlpha->SetMarkerSize(1.4);
+        gAlpha->SetMarkerColor(kBlack);
+        SetDataDrivenYRange(gAlpha, alpha_vals, 0.10);
+        gAlpha->Draw("APE");
+        gPad->Update();
+        gAlpha->GetXaxis()->SetLabelSize(0.075);
+        gAlpha->GetYaxis()->SetLabelSize(0.075);
+        gAlpha->GetXaxis()->SetTitleSize(0.080);
+        gAlpha->GetYaxis()->SetTitleSize(0.080);
+        gAlpha->GetXaxis()->SetTitleOffset(0.95);
+        gAlpha->GetYaxis()->SetTitleOffset(0.90);
+    }
 
     // ---- Pad 2: radii ----
     c_mT->cd(2);
-    TGraphErrors *gRout  = new TGraphErrors(nPoints, &mt_vals[0], &Rout_vals[0],
-                                            &mt_err[0],  &Rout_bootErr[0]);
-    gRout->SetMarkerStyle(23); gRout->SetMarkerSize(1.4);
-    gRout->SetMarkerColor(kRed); gRout->SetLineColor(kRed);
-    gRout->SetTitle("HBT radii vs m_{T}; m_{T} [GeV/c^{2}]; R [fm]");
+    if (nPoints > 0) {
+        TGraphErrors *gRout  = new TGraphErrors(nPoints, &mt_vals[0], &Rout_vals[0],
+                                                &mt_err[0],  &Rout_bootErr[0]);
+        gRout->SetMarkerStyle(23); gRout->SetMarkerSize(1.4);
+        gRout->SetMarkerColor(kRed); gRout->SetLineColor(kRed);
+        gRout->SetTitle("HBT radii vs m_{T}; m_{T} [GeV/c^{2}]; R [fm]");
 
-    TGraphErrors *gRside = new TGraphErrors(nPoints, &mt_vals[0], &Rside_vals[0],
-                                            &mt_err[0],  &Rside_bootErr[0]);
-    gRside->SetMarkerStyle(25); gRside->SetMarkerSize(1.4);
-    gRside->SetMarkerColor(kBlue); gRside->SetLineColor(kBlue);
+        TGraphErrors *gRside = new TGraphErrors(nPoints, &mt_vals[0], &Rside_vals[0],
+                                                &mt_err[0],  &Rside_bootErr[0]);
+        gRside->SetMarkerStyle(25); gRside->SetMarkerSize(1.4);
+        gRside->SetMarkerColor(kBlue); gRside->SetLineColor(kBlue);
 
-    TGraphErrors *gRlong = new TGraphErrors(nPoints, &mt_vals[0], &Rlong_vals[0],
-                                            &mt_err[0],  &Rlong_bootErr[0]);
-    gRlong->SetMarkerStyle(25); gRlong->SetMarkerSize(1.4);
-    gRlong->SetMarkerColor(kGreen+2); gRlong->SetLineColor(kGreen+2);
+        TGraphErrors *gRlong = new TGraphErrors(nPoints, &mt_vals[0], &Rlong_vals[0],
+                                                &mt_err[0],  &Rlong_bootErr[0]);
+        gRlong->SetMarkerStyle(25); gRlong->SetMarkerSize(1.4);
+        gRlong->SetMarkerColor(kGreen+2); gRlong->SetLineColor(kGreen+2);
 
-    gRout->GetHistogram()->GetYaxis()->SetRangeUser(1.0, 15.0);
-    gRout->Draw("APE");
-    gRside->Draw("P SAME");
-    gRlong->Draw("P SAME");
-    gPad->Update();
-    gRout->GetXaxis()->SetLabelSize(0.075);
-    gRout->GetYaxis()->SetLabelSize(0.075);
-    gRout->GetXaxis()->SetTitleSize(0.080);
-    gRout->GetYaxis()->SetTitleSize(0.080);
-    gRout->GetXaxis()->SetTitleOffset(0.95);
-    gRout->GetYaxis()->SetTitleOffset(0.90);
+        gRout->GetHistogram()->GetYaxis()->SetRangeUser(1.0, 15.0);
+        gRout->Draw("APE");
+        gRside->Draw("P SAME");
+        gRlong->Draw("P SAME");
+        gPad->Update();
+        gRout->GetXaxis()->SetLabelSize(0.075);
+        gRout->GetYaxis()->SetLabelSize(0.075);
+        gRout->GetXaxis()->SetTitleSize(0.080);
+        gRout->GetYaxis()->SetTitleSize(0.080);
+        gRout->GetXaxis()->SetTitleOffset(0.95);
+        gRout->GetYaxis()->SetTitleOffset(0.90);
 
-    TLegend *legRadii = new TLegend(0.58, 0.66, 0.90, 0.88);
-    legRadii->SetBorderSize(0);
-    legRadii->SetTextSize(0.065);
-    legRadii->SetFillStyle(0);
-    legRadii->AddEntry(gRout,  "R_{out}",  "P");
-    legRadii->AddEntry(gRside, "R_{side}", "P");
-    legRadii->AddEntry(gRlong, "R_{long}", "P");
-    legRadii->Draw();
+        TLegend *legRadii = new TLegend(0.58, 0.66, 0.90, 0.88);
+        legRadii->SetBorderSize(0);
+        legRadii->SetTextSize(0.065);
+        legRadii->SetFillStyle(0);
+        legRadii->AddEntry(gRout,  "R_{out}",  "P");
+        legRadii->AddEntry(gRside, "R_{side}", "P");
+        legRadii->AddEntry(gRlong, "R_{long}", "P");
+        legRadii->Draw();
+    }
 
     // ---- Pad 3: lambda ----
     c_mT->cd(3);
-    if ((int)lambda_bootSym.size() == nPoints) {
+    if ((int)lambda_bootSym.size() == nPoints && nPoints > 0) {
         TGraphErrors* gLambda = new TGraphErrors(nPoints,
             &mt_vals[0], &lambda_by_cutoff["1mm"][0],
             &mt_err[0],  &lambda_bootSym[0]);
